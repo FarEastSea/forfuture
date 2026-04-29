@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "18100:18100"
+    env_file: .env
+    volumes:
+      - ./backend/static:/app/static
+    depends_on:
+      - db
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${DATABASE_NAME:-AI_records_and_reminders}
+      POSTGRES_USER: ${DATABASE_USER:-AI_records_and_reminders}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-change-me}
+    ports:
+      - "${DATABASE_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body { background: #1a1a2e; padding: 20px; font-family: 'Microsoft YaHei', sans-serif; width: 420px; margin: 0; }
+.card { background: #16213e; border-radius: 12px; padding: 16px; margin-bottom: 12px; border: 1px solid #0f3460; }
+.header { display: flex; align-items: center; margin-bottom: 10px; }
+.avatar { width: 40px; height: 40px; border-radius: 50%; margin-right: 10px; object-fit: cover; }
+.nickname { color: #e94560; font-size: 14px; font-weight: bold; }
+.time { color: #666; font-size: 11px; margin-top: 2px; }
+.content { color: #eee; font-size: 13px; line-height: 1.6; margin: 8px 0; word-break: break-all; }
+.images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.images img { max-width: 180px; max-height: 180px; border-radius: 8px; object-fit: cover; }
+.platform-tag { background: #e94560; color: #fff; font-size: 10px; padding: 2px 8px; border-radius: 10px; margin-left: 8px; }
+.stats { color: #666; font-size: 11px; margin-top: 8px; }
+.alert-banner { background: linear-gradient(135deg, #e94560, #c23616); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+.alert-title { color: #fff; font-size: 16px; font-weight: bold; }
+.alert-desc { color: rgba(255,255,255,0.85); font-size: 13px; margin-top: 6px; line-height: 1.5; }
+</style>
+</head>
+<body>
+  <div class="alert-banner">
+    <div class="alert-title">{{ALERT_TITLE}}</div>
+    <div class="alert-desc">{{ALERT_DESC}}</div>
+  </div>
+  <!-- 动态卡片由后端动态填充 -->
+  {{CARDS}}
+</body>
+</html>

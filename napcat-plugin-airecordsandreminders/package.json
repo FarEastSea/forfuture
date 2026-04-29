@@ -1,0 +1,16 @@
+{
+  "name": "napcat-plugin-airecordsandreminders",
+  "plugin": "AI动态监控",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.mjs",
+  "description": "AI Records & Reminders - 与后端通信、发送QQ消息、转发事件",
+  "author": "AI Records",
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "napcat": {
+    "tags": ["工具", "AI"],
+    "minVersion": "4.14.0"
+  }
+}
