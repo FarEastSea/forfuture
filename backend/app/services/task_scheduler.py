@@ -30,6 +30,45 @@ class TaskSchedulerService:
             self.scheduler.shutdown(wait=False)
             self._started = False
 
+    async def _mark_login_account_verified(self, account_id: int, *, refreshed: bool = False):
+        from app.database import async_session
+        from app.models.account import Account
+        from app.services.account_risk_service import mark_account_verified
+
+        async with async_session() as db:
+            account = await db.get(Account, account_id)
+            if not account:
+                return
+
+            mark_account_verified(account, refreshed=refreshed)
+            await db.commit()
+
+    async def _mark_login_account_failure(
+        self,
+        account_id: int,
+        *,
+        reason: str,
+        relogin_required: bool = False,
+    ):
+        from app.database import async_session
+        from app.models.account import Account
+        from app.services.account_risk_service import load_risk_control_config, mark_account_failure
+
+        async with async_session() as db:
+            account = await db.get(Account, account_id)
+            if not account:
+                return None
+
+            config = await load_risk_control_config(db)
+            next_status = mark_account_failure(
+                account,
+                reason=reason,
+                config=config,
+                relogin_required=relogin_required,
+            )
+            await db.commit()
+            return next_status
+
     async def _load_active_tasks(self):
         from app.database import async_session
         from app.models.ai_task import AITask
@@ -115,75 +154,68 @@ class TaskSchedulerService:
 
     async def _cookie_refresh_wrapper(self):
         """定期刷新QQ和XHS cookies，失败时自动推送二维码重新登录。
-        仅在有active状态的登录账号时才执行。
+        仅在有可用登录账号时才执行；失败后写入共享风控状态。
         """
         try:
             from app.database import async_session
-            from app.models.account import Account
-            from sqlalchemy import select
+            from app.services.account_risk_service import get_preferred_login_account
+            from app.services.qq_crawler import qq_crawler
 
-            # 检查是否有active状态的QQ登录账号
             async with async_session() as db:
-                qq_login = await db.execute(
-                    select(Account).where(
-                        Account.platform == "qq",
-                        Account.is_target == 0,
-                        Account.status == "active",
-                    )
+                qq_login = await get_preferred_login_account(
+                    db,
+                    "qq",
+                    require_cookies=True,
+                    allow_degraded=True,
                 )
-                has_active_qq = qq_login.scalars().first() is not None
+                account_id = qq_login.id if qq_login else None
 
-            if not has_active_qq:
-                logger.debug("Cookie自动续期: 无active状态的QQ登录账号，跳过")
+            if not account_id:
+                logger.debug("Cookie自动续期: 无可用的QQ登录账号，跳过")
                 return
 
-            from app.services.qq_crawler import qq_crawler
-            result = await qq_crawler.refresh_qq_cookies()
+            result = await qq_crawler.refresh_qq_cookies(
+                login_account_id=account_id,
+                allow_degraded=True,
+            )
             if result:
+                await self._mark_login_account_verified(account_id, refreshed=True)
                 logger.info("QQ Cookie自动续期成功")
-            else:
-                logger.warning("QQ Cookie自动续期失败，尝试NapCat自动重新登录（免扫码）...")
-                # 优先尝试NapCat自动登录（免扫码，通过NapCat插件获取Cookie）
-                try:
-                    napcat_result = await qq_crawler.login_via_napcat()
-                    if napcat_result.get("success"):
-                        logger.info("QQ Cookie通过NapCat自动重新登录成功（免扫码）")
-                        return
-                    else:
-                        logger.warning(f"NapCat自动重新登录失败: {napcat_result.get('message')}")
-                except Exception as e_napcat:
-                    logger.warning(f"NapCat自动重新登录异常: {e_napcat}")
+                return
 
-                # NapCat自动登录失败，降级到推送二维码扫码登录
-                logger.warning("NapCat自动登录不可用，降级为推送二维码重新登录...")
-                try:
-                    relogin_ok = await qq_crawler.auto_relogin_via_napcat()
-                    if relogin_ok:
-                        logger.info("QQ Cookie自动重新登录成功（扫码）")
-                        return
-                    else:
-                        logger.warning("QQ Cookie自动重新登录失败，需要手动扫码")
-                except Exception as e_relogin:
-                    logger.error(f"QQ自动重新登录异常: {e_relogin}")
+            await self._mark_login_account_failure(
+                account_id,
+                reason="qq_cookie_refresh_failed",
+            )
+            logger.warning("QQ Cookie自动续期失败，尝试NapCat自动重新登录（免扫码）...")
 
-                # 所有重试方法均失败，标记账号过期并通知管理员
-                logger.error("QQ Cookie所有续期方法均失败，标记账号为expired")
-                try:
-                    async with async_session() as db:
-                        acc_result = await db.execute(
-                            select(Account).where(
-                                Account.platform == "qq",
-                                Account.is_target == 0,
-                                Account.status == "active",
-                            )
-                        )
-                        acc = acc_result.scalars().first()
-                        if acc:
-                            acc.status = "expired"
-                            await db.commit()
-                except Exception as e_db:
-                    logger.error(f"标记账号过期失败: {e_db}")
-                await qq_crawler._notify_cookie_expired("QQ空间", "Cookie自动续期和所有重试方法均失败，请手动登录")
+            try:
+                napcat_result = await qq_crawler.login_via_napcat()
+                if napcat_result.get("success"):
+                    await self._mark_login_account_verified(account_id, refreshed=True)
+                    logger.info("QQ Cookie通过NapCat自动重新登录成功（免扫码）")
+                    return
+                logger.warning(f"NapCat自动重新登录失败: {napcat_result.get('message')}")
+            except Exception as e_napcat:
+                logger.warning(f"NapCat自动重新登录异常: {e_napcat}")
+
+            logger.warning("NapCat自动登录不可用，降级为推送二维码重新登录...")
+            try:
+                relogin_ok = await qq_crawler.auto_relogin_via_napcat()
+                if relogin_ok:
+                    await self._mark_login_account_verified(account_id, refreshed=True)
+                    logger.info("QQ Cookie自动重新登录成功（扫码）")
+                    return
+                logger.warning("QQ Cookie自动重新登录失败，需要手动扫码")
+            except Exception as e_relogin:
+                logger.error(f"QQ自动重新登录异常: {e_relogin}")
+
+            await self._mark_login_account_failure(
+                account_id,
+                reason="qq_cookie_relogin_required",
+                relogin_required=True,
+            )
+            await qq_crawler._notify_cookie_expired("QQ空间", "Cookie自动续期和所有重试方法均失败，请手动登录")
         except Exception as e:
             logger.error(f"Cookie自动续期异常: {e}")
 
@@ -215,15 +247,18 @@ class TaskSchedulerService:
 
     async def execute_auto_crawl(self):
         """自动爬取所有已配置的QQ空间和小红书账号。
-        仅在有active状态的登录账号时才尝试cookie续期/重新登录。
+        仅在共享风控状态判定为可用时才启动爬取。
         """
         from app.database import async_session
         from app.models.account import Account
         from app.services.qq_crawler import qq_crawler
         from app.services.xhs_crawler import xhs_crawler
+        from app.services.account_risk_service import get_preferred_login_account, load_risk_control_config
         from sqlalchemy import select
 
         async with async_session() as db:
+            risk_config = await load_risk_control_config(db)
+
             # QQ目标账号
             qq_result = await db.execute(
                 select(Account).where(Account.platform == "qq", Account.is_target == 1)
@@ -238,43 +273,58 @@ class TaskSchedulerService:
             xhs_accounts = xhs_result.scalars().all()
             xhs_ids = [a.account_id for a in xhs_accounts]
 
-            # 检查是否有active状态的QQ登录账号
-            qq_login_result = await db.execute(
-                select(Account).where(
-                    Account.platform == "qq",
-                    Account.is_target == 0,
-                    Account.status == "active",
-                )
+            allow_degraded_for_crawl = not risk_config.skip_crawl_when_login_degraded
+            qq_login_account = await get_preferred_login_account(
+                db,
+                "qq",
+                require_cookies=True,
+                allow_degraded=allow_degraded_for_crawl,
             )
-            has_active_qq_login = qq_login_result.scalars().first() is not None
+            xhs_login_account = await get_preferred_login_account(
+                db,
+                "xhs",
+                require_cookies=True,
+                allow_degraded=False,
+            )
 
         if qq_ids:
-            if has_active_qq_login:
-                # 爬取前先刷新cookies（仅当登录账号active时）
+            if qq_login_account:
+                failure_reason = "qq_cookie_refresh_failed"
                 try:
-                    refresh_ok = await qq_crawler.refresh_qq_cookies()
-                    if not refresh_ok:
-                        logger.warning("爬取前Cookie续期失败，尝试NapCat自动重新登录...")
-                        # 优先NapCat自动登录（免扫码）
-                        try:
-                            napcat_result = await qq_crawler.login_via_napcat()
-                            if napcat_result.get("success"):
-                                logger.info("爬取前NapCat自动重新登录成功")
-                            else:
-                                logger.warning(f"NapCat自动登录失败: {napcat_result.get('message')}，降级为二维码...")
-                                await qq_crawler.auto_relogin_via_napcat()
-                        except Exception:
-                            await qq_crawler.auto_relogin_via_napcat()
+                    refresh_ok = await qq_crawler.refresh_qq_cookies(
+                        login_account_id=qq_login_account.id,
+                        allow_degraded=allow_degraded_for_crawl,
+                    )
                 except Exception as e:
-                    logger.warning(f"爬取前Cookie续期失败: {e}")
+                    refresh_ok = False
+                    failure_reason = f"qq_cookie_refresh_exception: {type(e).__name__}"
+                    logger.warning(f"自动爬取前QQ Cookie续期异常，已跳过本轮QQ抓取: {e}")
+
+                if refresh_ok:
+                    logger.info(f"自动爬取QQ空间: {qq_ids}")
+                    await qq_crawler.start_crawl(
+                        qq_ids,
+                        login_account_id=qq_login_account.id,
+                        allow_degraded_login=allow_degraded_for_crawl,
+                    )
+                else:
+                    await self._mark_login_account_failure(
+                        qq_login_account.id,
+                        reason=failure_reason,
+                    )
+                    logger.warning("自动爬取: QQ登录态不可用，已跳过本轮QQ抓取")
             else:
-                logger.debug("自动爬取: QQ登录账号未启用，跳过Cookie续期")
-            logger.info(f"自动爬取QQ空间: {qq_ids}")
-            await qq_crawler.start_crawl(qq_ids)
+                logger.warning("自动爬取: 无可用的QQ登录账号，已跳过本轮QQ抓取")
 
         if xhs_ids:
-            logger.info(f"自动爬取小红书: {xhs_ids}")
-            await xhs_crawler.start_crawl(xhs_ids)
+            if xhs_login_account:
+                logger.info(f"自动爬取小红书: {xhs_ids}")
+                await xhs_crawler.start_crawl(
+                    xhs_ids,
+                    login_account_id=xhs_login_account.id,
+                )
+            else:
+                logger.warning("自动爬取: 无可用的小红书登录账号，已跳过本轮小红书抓取")
 
         if not qq_ids and not xhs_ids:
             logger.info("自动爬取：暂无已配置的监控账号")

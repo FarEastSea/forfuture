@@ -4,13 +4,15 @@ from sqlalchemy import select
 from app.database import get_db
 from app.models.account import Account
 from app.config import settings as _settings
+from app.security import require_admin_http
+from app.services.account_risk_service import ACTIVE_STATUS, DISABLED_STATUS, RELOGIN_PENDING_STATUS, is_account_in_cooldown
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 import asyncio
 import os
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_admin_http)])
 
 
 def _verify_avatar(avatar_url: str | None, platform: str = "", account_id: str = "") -> str:
@@ -87,6 +89,13 @@ async def get_accounts(platform: Optional[str] = None, db: AsyncSession = Depend
             "status": a.status,
             "is_target": a.is_target,
             "last_login": a.last_login.isoformat() if a.last_login else None,
+            "cookie_last_validated_at": a.cookie_last_validated_at.isoformat() if a.cookie_last_validated_at else None,
+            "last_cookie_refresh_at": a.last_cookie_refresh_at.isoformat() if a.last_cookie_refresh_at else None,
+            "last_failure_at": a.last_failure_at.isoformat() if a.last_failure_at else None,
+            "last_failure_reason": a.last_failure_reason,
+            "risk_cooldown_until": a.risk_cooldown_until.isoformat() if a.risk_cooldown_until else None,
+            "failure_count": a.failure_count or 0,
+            "is_in_cooldown": is_account_in_cooldown(a),
         }
         for a in accounts
     ]
@@ -116,19 +125,19 @@ async def refresh_account(account_id: int, db: AsyncSession = Depends(get_db)):
     try:
         if account.platform == "xhs":
             from app.database import async_session as _async_session
+            from app.services.account_risk_service import get_preferred_login_account
             import json
 
             # 获取登录Cookie
             login_account = account if account.is_target == 0 else None
             if not login_account:
                 async with _async_session() as db2:
-                    from sqlalchemy import select as _select
-                    r = await db2.execute(
-                        _select(Account).where(
-                            Account.platform == "xhs", Account.status == "active", Account.is_target == 0
-                        ).order_by(Account.last_login.desc())
+                    login_account = await get_preferred_login_account(
+                        db2,
+                        "xhs",
+                        require_cookies=True,
+                        allow_degraded=True,
                     )
-                    login_account = r.scalars().first()
 
             if not login_account or not login_account.cookies:
                 raise HTTPException(status_code=503, detail="小红书未登录，请先扫码登录")
@@ -336,6 +345,7 @@ async def refresh_account(account_id: int, db: AsyncSession = Depends(get_db)):
         elif account.platform == "qq":
             import aiohttp, ssl as _ssl, json, re
             from app.services.media_service import media_service
+            from app.services.account_risk_service import get_preferred_login_account
             from app.services.qq_crawler import compute_g_tk
 
             # 加载QQ登录Cookie（portrait API需要鉴权）
@@ -343,13 +353,12 @@ async def refresh_account(account_id: int, db: AsyncSession = Depends(get_db)):
             cookies_dict = {}
             g_tk = 0
             async with _async_session() as db2:
-                from sqlalchemy import select as _select
-                login_r = await db2.execute(
-                    _select(Account).where(
-                        Account.platform == "qq", Account.status == "active", Account.is_target == 0
-                    ).order_by(Account.last_login.desc())
+                login_acc = await get_preferred_login_account(
+                    db2,
+                    "qq",
+                    require_cookies=True,
+                    allow_degraded=True,
                 )
-                login_acc = login_r.scalars().first()
                 if login_acc and login_acc.cookies:
                     cookies_list = json.loads(login_acc.cookies)
                     for c in cookies_list:
@@ -662,7 +671,15 @@ async def toggle_account(account_id: int, db: AsyncSession = Depends(get_db)):
     account = result.scalar_one_or_none()
     if not account:
         raise HTTPException(status_code=404, detail="账号不存在")
-    account.status = "disabled" if account.status == "active" else "active"
+
+    if account.status == DISABLED_STATUS:
+        if account.is_target == 0 and ((account.failure_count or 0) > 0 or not account.cookies):
+            account.status = RELOGIN_PENDING_STATUS
+        else:
+            account.status = ACTIVE_STATUS
+            account.risk_cooldown_until = None
+    else:
+        account.status = DISABLED_STATUS
     await db.commit()
     return {"id": account.id, "status": account.status, "message": f"已{'禁用' if account.status == 'disabled' else '启用'}"}
 
@@ -730,7 +747,7 @@ async def refresh_qq_cookies():
     """手动触发QQ空间Cookie续期"""
     from app.services.qq_crawler import qq_crawler
     try:
-        success = await qq_crawler.refresh_qq_cookies()
+        success = await qq_crawler.refresh_qq_cookies(allow_degraded=True)
         if success:
             return {"success": True, "message": "Cookie续期成功"}
         else:

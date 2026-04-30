@@ -5,6 +5,33 @@
         <template #title><icon-user /> 账号管理</template>
         <div class="settings-card">
         <div class="settings-section">
+          <div class="settings-overview-grid">
+            <div class="settings-overview-card">
+              <span class="settings-overview-label">监控账号</span>
+              <strong class="settings-overview-value">{{ monitoredAccounts.length }}</strong>
+            </div>
+            <div class="settings-overview-card">
+              <span class="settings-overview-label">登录账号</span>
+              <strong class="settings-overview-value">{{ loginAccounts.length }}</strong>
+            </div>
+            <div class="settings-overview-card">
+              <span class="settings-overview-label">当前启用</span>
+              <strong class="settings-overview-value">{{ activeAccountCount }}</strong>
+            </div>
+            <div class="settings-overview-card">
+              <span class="settings-overview-label">风险登录</span>
+              <strong class="settings-overview-value">{{ elevatedLoginRiskCount }}</strong>
+            </div>
+            <div class="settings-overview-card">
+              <span class="settings-overview-label">冷却账号</span>
+              <strong class="settings-overview-value">{{ cooldownLoginCount }}</strong>
+            </div>
+            <div class="settings-overview-card accent">
+              <span class="settings-overview-label">账号同步</span>
+              <strong class="settings-overview-value">{{ refreshingAll ? '进行中' : '待命' }}</strong>
+            </div>
+          </div>
+
           <div class="section-header">
             <h3>监控账号</h3>
             <a-space>
@@ -19,6 +46,12 @@
             </a-space>
           </div>
           <p class="section-desc">要爬取动态的目标账号（被监控的人）</p>
+          <div v-if="refreshingAll" class="inline-state-card compact">
+            <div>
+              <strong>正在批量刷新账号资料</strong>
+              <p>系统会重新同步头像、昵称和签名，完成后自动刷新当前列表。</p>
+            </div>
+          </div>
 
           <!-- QQ 监控账号 -->
           <div v-if="monitoredQQAccounts.length > 0" class="settings-data-block">
@@ -57,7 +90,7 @@
                 </a-table-column>
                 <a-table-column title="状态" :width="90">
                   <template #cell="{ record }">
-                    <a-badge :status="record.status === 'active' ? 'success' : 'danger'" :text="record.status === 'active' ? '已启用' : '已禁用'" />
+                    <a-badge :status="getAccountStatusBadge(record).badgeStatus" :text="getAccountStatusBadge(record).text" />
                   </template>
                 </a-table-column>
                 <a-table-column title="操作" :width="200">
@@ -68,8 +101,8 @@
                           <template #icon><icon-refresh /></template>
                         </a-button>
                       </a-tooltip>
-                      <a-button size="small" :type="record.status === 'active' ? 'secondary' : 'primary'" @click="toggleAccount(record.id)">
-                        {{ record.status === 'active' ? '禁用' : '启用' }}
+                      <a-button size="small" :type="getAccountToggleType(record)" @click="toggleAccount(record.id)">
+                        {{ getAccountToggleLabel(record) }}
                       </a-button>
                       <a-popconfirm content="确定删除？" @ok="removeAccount(record.id)">
                         <a-button size="small" status="danger"><icon-delete /></a-button>
@@ -136,7 +169,7 @@
                 </a-table-column>
                 <a-table-column title="状态" :width="90">
                   <template #cell="{ record }">
-                    <a-badge :status="record.status === 'active' ? 'success' : 'danger'" :text="record.status === 'active' ? '已启用' : '已禁用'" />
+                    <a-badge :status="getAccountStatusBadge(record).badgeStatus" :text="getAccountStatusBadge(record).text" />
                   </template>
                 </a-table-column>
                 <a-table-column title="操作" :width="200">
@@ -147,8 +180,8 @@
                           <template #icon><icon-refresh /></template>
                         </a-button>
                       </a-tooltip>
-                      <a-button size="small" :type="record.status === 'active' ? 'secondary' : 'primary'" @click="toggleAccount(record.id)">
-                        {{ record.status === 'active' ? '禁用' : '启用' }}
+                      <a-button size="small" :type="getAccountToggleType(record)" @click="toggleAccount(record.id)">
+                        {{ getAccountToggleLabel(record) }}
                       </a-button>
                       <a-popconfirm content="确定删除？" @ok="removeAccount(record.id)">
                         <a-button size="small" status="danger"><icon-delete /></a-button>
@@ -194,7 +227,15 @@
                 </a-table-column>
                 <a-table-column title="状态" :width="80">
                   <template #cell="{ record }">
-                    <a-badge :status="record.status === 'active' ? 'success' : 'danger'" :text="record.status === 'active' ? '有效' : '过期'" />
+                    <a-badge :status="getAccountStatusBadge(record, 'login').badgeStatus" :text="getAccountStatusBadge(record, 'login').text" />
+                  </template>
+                </a-table-column>
+                <a-table-column title="风控" :width="220">
+                  <template #cell="{ record }">
+                    <div>
+                      <div class="cell-secondary-text">{{ formatRiskSummary(record) }}</div>
+                      <div v-if="record.last_cookie_refresh_at" class="cell-muted-text">最近续期 {{ formatShortDateTime(record.last_cookie_refresh_at) }}</div>
+                    </div>
                   </template>
                 </a-table-column>
                 <a-table-column title="登录时间" :width="160">
@@ -210,8 +251,8 @@
                           <template #icon><icon-refresh /></template>
                         </a-button>
                       </a-tooltip>
-                      <a-button size="mini" :type="record.status === 'active' ? 'secondary' : 'primary'" @click="toggleAccount(record.id)">
-                        {{ record.status === 'active' ? '禁用' : '启用' }}
+                      <a-button size="mini" :type="getAccountToggleType(record)" @click="toggleAccount(record.id)">
+                        {{ getAccountToggleLabel(record) }}
                       </a-button>
                       <a-popconfirm content="删除此登录账号？" @ok="removeAccount(record.id)">
                         <a-button size="mini" status="danger"><icon-delete /></a-button>
@@ -276,7 +317,15 @@
                 </a-table-column>
                 <a-table-column title="状态" :width="80">
                   <template #cell="{ record }">
-                    <a-badge :status="record.status === 'active' ? 'success' : 'danger'" :text="record.status === 'active' ? '有效' : '过期'" />
+                    <a-badge :status="getAccountStatusBadge(record, 'login').badgeStatus" :text="getAccountStatusBadge(record, 'login').text" />
+                  </template>
+                </a-table-column>
+                <a-table-column title="风控" :width="220">
+                  <template #cell="{ record }">
+                    <div>
+                      <div class="cell-secondary-text">{{ formatRiskSummary(record) }}</div>
+                      <div v-if="record.last_cookie_refresh_at" class="cell-muted-text">最近续期 {{ formatShortDateTime(record.last_cookie_refresh_at) }}</div>
+                    </div>
                   </template>
                 </a-table-column>
                 <a-table-column title="登录时间" :width="160">
@@ -292,8 +341,8 @@
                           <template #icon><icon-refresh /></template>
                         </a-button>
                       </a-tooltip>
-                      <a-button size="mini" :type="record.status === 'active' ? 'secondary' : 'primary'" @click="toggleAccount(record.id)">
-                        {{ record.status === 'active' ? '禁用' : '启用' }}
+                      <a-button size="mini" :type="getAccountToggleType(record)" @click="toggleAccount(record.id)">
+                        {{ getAccountToggleLabel(record) }}
                       </a-button>
                       <a-popconfirm content="删除此登录账号？" @ok="removeAccount(record.id)">
                         <a-button size="mini" status="danger"><icon-delete /></a-button>
@@ -389,7 +438,7 @@
                 </a-popconfirm>
               </div>
             </div>
-            <div class="preview-viewport" v-if="browserPreviewFrame && browserPreviewFrame.screenshot">
+            <div class="preview-viewport" v-if="previewState === 'ready'">
               <img
                 :src="'data:image/jpeg;base64,' + browserPreviewFrame.screenshot"
                 class="preview-screenshot"
@@ -401,8 +450,19 @@
               />
               <div class="preview-fps">{{ previewFps }} FPS</div>
             </div>
-            <!-- 键盘输入区域 -->
-            <div v-if="browserPreviewConnected" class="preview-input-bar">
+            <div v-else-if="previewState === 'booting'" class="preview-placeholder">
+              <icon-loading /> 浏览器已连接，正在获取第一帧截图...
+            </div>
+            <div v-else-if="previewState === 'starting'" class="preview-placeholder">
+              <icon-loading /> 浏览器连接已建立，正在等待登录页启动...
+            </div>
+            <div v-else-if="previewState === 'connecting'" class="preview-placeholder">
+              <icon-loading /> 正在建立浏览器预览连接...
+            </div>
+            <div v-else-if="previewState === 'idle'" class="preview-placeholder">
+              点击“连接预览”查看后端浏览器实时画面
+            </div>
+            <div v-if="browserPreviewConnected && previewState === 'ready'" class="preview-input-bar">
               <a-input
                 v-model="previewInputText"
                 placeholder="输入文字（如验证码），按回车发送"
@@ -417,15 +477,6 @@
               <a-button size="small" type="primary" @click="sendPreviewText" :disabled="!previewInputText">
                 发送
               </a-button>
-            </div>
-            <div v-else-if="browserPreviewConnected && browserPreviewFrame" class="preview-placeholder">
-              <icon-loading /> 浏览器已启动，正在获取截图...
-            </div>
-            <div v-else-if="browserPreviewConnected" class="preview-placeholder">
-              <icon-loading /> 等待浏览器启动...
-            </div>
-            <div v-else-if="!browserPreviewConnected && qrcodeLoginType" class="preview-placeholder">
-              点击"连接预览"查看后端浏览器实时画面
             </div>
             <!-- 事件日志 -->
             <div v-if="browserPreviewEvents.length > 0" class="preview-events">
@@ -463,9 +514,18 @@
               </div>
             </div>
             <div class="config-detail">
-              <span>API: {{ config.api_base }}</span>
-              <span>模型: {{ config.model }}</span>
-              <span>Key: {{ config.api_key }}</span>
+              <div class="config-detail-item">
+                <span class="config-detail-label">API</span>
+                <span>{{ config.api_base }}</span>
+              </div>
+              <div class="config-detail-item">
+                <span class="config-detail-label">模型</span>
+                <span>{{ config.model }}</span>
+              </div>
+              <div class="config-detail-item config-detail-secret">
+                <span class="config-detail-label">Key</span>
+                <span class="config-secret">{{ config.api_key }}</span>
+              </div>
             </div>
           </div>
           <div v-if="aiConfigs.length === 0" class="sub-text settings-empty-card settings-empty-card-tight">
@@ -480,7 +540,7 @@
           <h3>AI对话上下文模式</h3>
           <p class="section-desc">控制AI对话时如何引入动态记录。默认全量模式，当数据量过大超过上下文限制时可切换到智能模式。</p>
 
-          <a-form layout="vertical" class="settings-form">
+          <a-form :model="{ aiContextMode, aiVisionEnabled, serverBaseUrl }" layout="vertical" class="settings-form">
             <a-form-item label="上下文模式">
               <a-radio-group v-model="aiContextMode" direction="vertical" @change="saveAIContextMode">
                 <a-radio value="full">
@@ -609,7 +669,7 @@
               </p>
             </div>
           </a-alert>
-          <a-form layout="vertical" class="settings-form">
+          <a-form :model="adminForm" layout="vertical" class="settings-form">
             <a-form-item label="允许向被监控账号发消息">
               <a-switch v-model="adminForm.allow_send_to_monitored" @change="saveAdminSafety">
                 <template #checked>允许（危险）</template>
@@ -662,7 +722,7 @@
         <div class="settings-card">
         <div class="settings-section">
           <h3>自动爬取</h3>
-          <a-form layout="vertical" class="settings-form">
+          <a-form :model="{ autoCrawlEnabled, autoCrawlInterval }" layout="vertical" class="settings-form">
             <a-form-item label="启用自动爬取">
               <a-switch v-model="autoCrawlEnabled" @change="saveAutoCrawlConfig" />
             </a-form-item>
@@ -676,8 +736,33 @@
 
         <div class="settings-card">
         <div class="settings-section">
+          <h3>登录风控</h3>
+          <p class="section-desc">控制登录账号进入降级、冷却或待重新登录后的自动抓取策略。</p>
+          <a-form :model="{ skipCrawlWhenLoginDegraded, cookieFailureThreshold, riskCooldownMinutes }" layout="vertical" class="settings-form">
+            <a-form-item>
+              <div class="switch-setting-row">
+                <a-switch v-model="skipCrawlWhenLoginDegraded" />
+                <div>
+                  <strong>登录账号降级时跳过自动抓取</strong>
+                  <div class="form-help-text">开启后，只要登录账号进入 degraded、冷却或待重新登录状态，本轮自动抓取会直接 fail-closed。</div>
+                </div>
+              </div>
+            </a-form-item>
+            <a-form-item label="失败阈值" help="同一登录账号累计失败达到阈值后，会进入待重新登录状态。">
+              <a-input-number v-model="cookieFailureThreshold" :min="1" :max="10" size="large" />
+            </a-form-item>
+            <a-form-item label="冷却时间（分钟）" help="失败后暂停再次使用该登录账号的时间窗口；0 表示不设置冷却。">
+              <a-input-number v-model="riskCooldownMinutes" :min="0" :max="1440" size="large" />
+            </a-form-item>
+            <a-button size="large" @click="saveRiskControlConfig">保存风控配置</a-button>
+          </a-form>
+        </div>
+        </div>
+
+        <div class="settings-card">
+        <div class="settings-section">
           <h3>NapCat连接</h3>
-          <a-form layout="vertical" class="settings-form">
+          <a-form :model="{ napcatUrl, napcatToken }" layout="vertical" class="settings-form">
             <a-form-item label="NapCat WebSocket地址">
               <a-input v-model="napcatUrl" placeholder="ws://127.0.0.1:3001" size="large" />
             </a-form-item>
@@ -695,7 +780,7 @@
         <div class="settings-section">
           <h3>通知设置</h3>
           <p class="section-desc">Cookie过期时通过QQ向管理员发送提醒，防止爬取任务失败</p>
-          <a-form layout="vertical" class="settings-form">
+          <a-form :model="{ loginNotifyEnabled }" layout="vertical" class="settings-form">
             <a-form-item label="Cookie过期通知">
               <a-switch v-model="loginNotifyEnabled" @change="saveLoginNotifyConfig">
                 <template #checked>开启</template>
@@ -797,8 +882,11 @@
         <a-form-item label="API地址" required>
           <a-input v-model="configForm.api_base" placeholder="如：https://api.openai.com/v1" />
         </a-form-item>
-        <a-form-item label="API Key" required>
-          <a-input-password v-model="configForm.api_key" placeholder="sk-..." />
+        <a-form-item label="API Key" :required="!editingConfig">
+          <a-input-password v-model="configForm.api_key" :placeholder="editingConfig ? '留空则保留当前密钥' : 'sk-...'" />
+          <template v-if="editingConfig" #extra>
+            <span class="form-help-inline">不再回显现有密钥；只有重新输入时才会更新。</span>
+          </template>
         </a-form-item>
         <a-form-item label="模型名称" required>
           <a-input v-model="configForm.model" placeholder="如：gpt-4o-mini" />
@@ -824,6 +912,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { authApi, aiConfigApi, systemApi } from '@/api'
+import { openAdminWebSocket } from '@/utils/adminToken'
 import { Message } from '@arco-design/web-vue'
 import { IconPlus, IconEdit, IconDelete, IconScan, IconRefresh, IconCopy, IconLoading, IconEye, IconRobot, IconArrowRight, IconSave, IconUser, IconThunderbolt, IconSafe, IconStorage, IconSettings, IconFile } from '@arco-design/web-vue/es/icon'
 
@@ -835,6 +924,9 @@ const monitoredQQAccounts = computed(() => monitoredAccounts.value.filter(a => a
 const monitoredXHSAccounts = computed(() => monitoredAccounts.value.filter(a => a.platform === 'xhs'))
 const loginQQAccounts = computed(() => loginAccounts.value.filter(a => a.platform === 'qq'))
 const loginXHSAccounts = computed(() => loginAccounts.value.filter(a => a.platform === 'xhs'))
+const activeAccountCount = computed(() => accounts.value.filter(a => a.status === 'active').length)
+const elevatedLoginRiskCount = computed(() => loginAccounts.value.filter(a => ['degraded', 'relogin_pending', 'expired'].includes(normalizeAccountStatus(a.status))).length)
+const cooldownLoginCount = computed(() => loginAccounts.value.filter(a => Boolean(a.is_in_cooldown)).length)
 const accountModalVisible = ref(false)
 const accountForm = reactive({ platform: 'qq', account_id: '', nickname: '' })
 const refreshingId = ref<number | null>(null)
@@ -874,6 +966,9 @@ let logRefreshTimer: ReturnType<typeof setInterval> | null = null
 // 自动爬取
 const autoCrawlEnabled = ref(true)
 const autoCrawlInterval = ref(60)
+const skipCrawlWhenLoginDegraded = ref(true)
+const cookieFailureThreshold = ref(2)
+const riskCooldownMinutes = ref(30)
 
 // AI上下文模式
 const aiContextMode = ref('full')
@@ -928,26 +1023,114 @@ let previewWs: WebSocket | null = null
 let previewFrameCount = 0
 let previewFpsTimer: ReturnType<typeof setInterval> | null = null
 const keepPreviewAfterLogin = ref(false)
+const previewState = computed(() => {
+  if (browserPreviewFrame.value?.screenshot) return 'ready'
+  if (browserPreviewConnected.value && browserPreviewFrame.value) return 'booting'
+  if (browserPreviewConnected.value) return 'starting'
+  if (browserPreviewActive.value) return 'connecting'
+  if (qrcodeLoginType.value) return 'idle'
+  return 'hidden'
+})
+
+function getErrorMessage(error: unknown, fallback: string) {
+  if (typeof error === 'object' && error && 'response' in error) {
+    const detail = (error as any).response?.data?.detail
+    if (typeof detail === 'string' && detail) return detail
+  }
+  if (error instanceof Error && error.message) return error.message
+  return fallback
+}
+
+function normalizeAccountStatus(status?: string) {
+  return (status || 'active').trim().toLowerCase()
+}
+
+function getAccountStatusBadge(account: any, mode: 'monitor' | 'login' = 'monitor') {
+  const normalizedStatus = normalizeAccountStatus(account.status)
+
+  if (normalizedStatus === 'disabled') {
+    return { badgeStatus: 'normal', text: '已禁用' }
+  }
+  if (normalizedStatus === 'degraded') {
+    return { badgeStatus: 'warning', text: mode === 'login' ? '降级' : '已启用' }
+  }
+  if (normalizedStatus === 'relogin_pending') {
+    return { badgeStatus: 'danger', text: mode === 'login' ? '待重登' : '待处理' }
+  }
+  if (normalizedStatus === 'expired') {
+    return { badgeStatus: 'danger', text: mode === 'login' ? '已过期' : '异常' }
+  }
+
+  return { badgeStatus: 'success', text: mode === 'login' ? '有效' : '已启用' }
+}
+
+function getAccountToggleType(account: any) {
+  return normalizeAccountStatus(account.status) === 'disabled' ? 'primary' : 'secondary'
+}
+
+function getAccountToggleLabel(account: any) {
+  return normalizeAccountStatus(account.status) === 'disabled' ? '启用' : '禁用'
+}
+
+function formatShortDateTime(value?: string | null) {
+  if (!value) return '-'
+  return value.replace('T', ' ').slice(0, 16)
+}
+
+function shortenRiskReason(reason?: string | null) {
+  if (!reason) return ''
+  return reason.length > 26 ? `${reason.slice(0, 26)}...` : reason
+}
+
+function formatRiskSummary(account: any) {
+  const normalizedStatus = normalizeAccountStatus(account.status)
+
+  if (account.is_in_cooldown && account.risk_cooldown_until) {
+    return `冷却至 ${formatShortDateTime(account.risk_cooldown_until)}`
+  }
+  if (normalizedStatus === 'relogin_pending') {
+    return account.last_failure_reason ? `待重新登录 · ${shortenRiskReason(account.last_failure_reason)}` : '待重新登录'
+  }
+  if (normalizedStatus === 'degraded') {
+    return account.last_failure_reason ? `降级运行 · ${shortenRiskReason(account.last_failure_reason)}` : '降级运行'
+  }
+  if (normalizedStatus === 'expired') {
+    return account.last_failure_reason ? `Cookie 已过期 · ${shortenRiskReason(account.last_failure_reason)}` : 'Cookie 已过期'
+  }
+  if (account.failure_count) {
+    return account.last_failure_reason ? `累计失败 ${account.failure_count} 次 · ${shortenRiskReason(account.last_failure_reason)}` : `累计失败 ${account.failure_count} 次`
+  }
+  if (account.cookie_last_validated_at) {
+    return `最近验证 ${formatShortDateTime(account.cookie_last_validated_at)}`
+  }
+  return '尚未记录 Cookie 验证'
+}
 
 async function loadAccounts() {
   try {
     const { data } = await authApi.getAccounts()
     accounts.value = data || []
-  } catch {}
+  } catch (e: any) {
+    Message.error(getErrorMessage(e, '账号列表加载失败'))
+  }
 }
 
 async function loadAIConfigs() {
   try {
     const { data } = await aiConfigApi.getConfigs()
     aiConfigs.value = data || []
-  } catch {}
+  } catch (e: any) {
+    Message.error(getErrorMessage(e, 'AI 配置加载失败'))
+  }
 }
 
 async function loadDbConfig() {
   try {
     const { data } = await systemApi.getDbConfig()
     Object.assign(dbForm, data)
-  } catch {}
+  } catch (e: any) {
+    Message.error(getErrorMessage(e, '数据库配置加载失败'))
+  }
 }
 
 function showAddAccount() {
@@ -966,7 +1149,13 @@ async function addAccount() {
 }
 
 async function removeAccount(id: number) {
-  try { await authApi.deleteAccount(id); loadAccounts() } catch {}
+  try {
+    await authApi.deleteAccount(id)
+    Message.success('账号已删除')
+    loadAccounts()
+  } catch (e: any) {
+    Message.error(getErrorMessage(e, '删除账号失败'))
+  }
 }
 
 async function toggleAccount(id: number) {
@@ -995,7 +1184,7 @@ async function refreshAllAccountsAction() {
   try {
     const { data } = await authApi.refreshAllAccounts()
     Message.success(data.message || '刷新完成')
-    loadAccounts()
+    await loadAccounts()
   } catch (e: any) {
     Message.error(e.response?.data?.detail || '批量刷新失败')
   } finally {
@@ -1035,7 +1224,7 @@ function editConfig(config: any) {
   editingConfig.value = config
   Object.assign(configForm, {
     name: config.name, api_base: config.api_base,
-    api_key: config.api_key_full || config.api_key,
+    api_key: '',
     model: config.model, embed_model: config.embed_model || '',
     max_tokens: config.max_tokens, temperature: config.temperature,
   })
@@ -1044,7 +1233,7 @@ function editConfig(config: any) {
 }
 
 async function saveConfig() {
-  if (!configForm.name || !configForm.api_base || !configForm.api_key || !configForm.model) {
+  if (!configForm.name || !configForm.api_base || !configForm.model || (!editingConfig.value && !configForm.api_key)) {
     Message.warning('请填写必填项'); return
   }
   configSaving.value = true
@@ -1066,11 +1255,19 @@ async function activateConfig(id: number) {
     await aiConfigApi.activateConfig(id)
     Message.success('已激活')
     loadAIConfigs()
-  } catch {}
+  } catch (e: any) {
+    Message.error(getErrorMessage(e, '激活配置失败'))
+  }
 }
 
 async function deleteConfig(id: number) {
-  try { await aiConfigApi.deleteConfig(id); loadAIConfigs() } catch {}
+  try {
+    await aiConfigApi.deleteConfig(id)
+    Message.success('配置已删除')
+    loadAIConfigs()
+  } catch (e: any) {
+    Message.error(getErrorMessage(e, '删除配置失败'))
+  }
 }
 
 async function testAIConfig() {
@@ -1149,6 +1346,28 @@ async function saveAutoCrawlConfig() {
   }
 }
 
+async function saveRiskControlConfig() {
+  if (cookieFailureThreshold.value < 1) {
+    Message.warning('失败阈值至少为 1')
+    return
+  }
+  if (riskCooldownMinutes.value < 0) {
+    Message.warning('冷却时间不能小于 0')
+    return
+  }
+
+  try {
+    await systemApi.updateConfigs([
+      { key: 'skip_crawl_when_login_degraded', value: skipCrawlWhenLoginDegraded.value ? 'true' : 'false' },
+      { key: 'cookie_failure_threshold', value: String(cookieFailureThreshold.value) },
+      { key: 'risk_cooldown_minutes', value: String(riskCooldownMinutes.value) },
+    ])
+    Message.success('登录风控配置已保存')
+  } catch (e: any) {
+    Message.error(getErrorMessage(e, '保存风控配置失败'))
+  }
+}
+
 async function saveAutoSummaryEnabled() {
   try {
     await systemApi.updateConfigs([
@@ -1222,6 +1441,9 @@ async function loadSystemConfigs() {
     for (const c of data) {
       if (c.key === 'auto_crawl_enabled') autoCrawlEnabled.value = c.value !== 'false'
       if (c.key === 'auto_crawl_interval') autoCrawlInterval.value = parseInt(c.value) || 60
+      if (c.key === 'skip_crawl_when_login_degraded') skipCrawlWhenLoginDegraded.value = c.value !== 'false'
+      if (c.key === 'cookie_failure_threshold') cookieFailureThreshold.value = parseInt(c.value) || 2
+      if (c.key === 'risk_cooldown_minutes') riskCooldownMinutes.value = parseInt(c.value) || 0
       if (c.key === 'napcat_ws_url' && c.value) napcatUrl.value = c.value
       if (c.key === 'napcat_token' && c.value) napcatToken.value = c.value
       if (c.key === 'login_notify_enabled') loginNotifyEnabled.value = c.value === 'true'
@@ -1342,7 +1564,7 @@ function startBrowserPreview(platform: string) {
   // 计算 WebSocket URL
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const wsUrl = `${protocol}//${window.location.host}/ws/browser-preview`
-  previewWs = new WebSocket(wsUrl)
+  previewWs = openAdminWebSocket(wsUrl)
 
   previewWs.onopen = () => {
     browserPreviewConnected.value = true
@@ -1383,11 +1605,13 @@ function startBrowserPreview(platform: string) {
 
   previewWs.onclose = () => {
     browserPreviewConnected.value = false
+    browserPreviewActive.value = false
     addPreviewEvent('WebSocket 已断开')
     if (previewFpsTimer) { clearInterval(previewFpsTimer); previewFpsTimer = null }
   }
 
   previewWs.onerror = () => {
+    browserPreviewActive.value = false
     addPreviewEvent('WebSocket 连接错误')
   }
 }

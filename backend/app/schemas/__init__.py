@@ -77,20 +77,14 @@ class AIConfigCreate(BaseModel):
     temperature: int = 7
 
 
-class AIConfigOut(BaseModel):
-    id: int
+class AIConfigUpdate(BaseModel):
     name: str
     api_base: str
-    api_key: str
+    api_key: Optional[str] = None
     model: str
     embed_model: Optional[str] = None
     max_tokens: int = 4096
     temperature: int = 7
-    is_active: bool = False
-    created_at: Optional[datetime] = None
-
-    class Config:
-        from_attributes = True
 
 
 class ChatMessageCreate(BaseModel):
@@ -122,7 +116,7 @@ class AITaskCreate(BaseModel):
     name: str
     description: str
     target_qq: Optional[str] = "admin"  # "admin"=管理员QQ，或指定QQ号
-    task_type: str = "recurring"  # temporal/recurring/oneoff
+    task_type: Optional[str] = None  # temporal/recurring/oneoff，未传时由后端决定或保留原值
     cron_expr: Optional[str] = None
     interval_minutes: Optional[int] = None
     message_format: str = "text_image"

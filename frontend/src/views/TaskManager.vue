@@ -8,11 +8,20 @@
       </a-button>
     </div>
 
+    <div v-if="taskError" class="inline-state-card error compact">
+      <div>
+        <strong>任务列表加载失败</strong>
+        <p>{{ taskError }}</p>
+      </div>
+      <a-button size="small" type="outline" @click="loadTasks">重新加载</a-button>
+    </div>
+
     <a-spin :loading="loading" style="width:100%">
-      <div v-if="tasks.length === 0 && !loading" class="empty-state">
+      <div v-if="tasks.length === 0 && !loading && !taskError" class="empty-state">
         <icon-clock-circle :size="48" />
         <p>暂无定时任务</p>
         <p class="sub-text">创建任务后，AI会定时分析记录并在满足条件时通过QQ通知你</p>
+        <a-button type="outline" @click="showCreateModal">创建第一个任务</a-button>
       </div>
 
       <div v-for="task in tasks" :key="task.id" class="task-card">
@@ -40,20 +49,22 @@
           <span>已触发: {{ task.trigger_count }}次</span>
           <span v-if="task.last_run">上次执行: {{ formatTime(task.last_run) }}</span>
         </div>
-        <a-collapse :bordered="false" class="task-logs-collapse">
+        <a-collapse :bordered="false" class="task-logs-collapse" @change="handleLogsExpand(task.id, $event)">
           <a-collapse-item header="执行日志" :key="task.id">
-            <div v-if="taskLogs[task.id]">
-              <div v-for="log in taskLogs[task.id]" :key="log.id" class="log-item">
-                <span class="log-time">{{ formatTime(log.run_at) }}</span>
-                <a-tag :color="log.triggered ? 'orange' : 'gray'" size="small">
-                  {{ log.triggered ? '已触发' : '静默' }}
-                </a-tag>
-                <span class="log-reason">{{ log.ai_reason }}</span>
-                <span v-if="log.error" class="log-error">{{ log.error }}</span>
+            <a-spin :loading="Boolean(logLoadingMap[task.id])" style="width:100%">
+              <div v-if="taskLogs[task.id]">
+                <div v-for="log in taskLogs[task.id]" :key="log.id" class="log-item">
+                  <span class="log-time">{{ formatTime(log.run_at) }}</span>
+                  <a-tag :color="log.triggered ? 'orange' : 'gray'" size="small">
+                    {{ log.triggered ? '已触发' : '静默' }}
+                  </a-tag>
+                  <span class="log-reason">{{ log.ai_reason }}</span>
+                  <span v-if="log.error" class="log-error">{{ log.error }}</span>
+                </div>
+                <div v-if="taskLogs[task.id].length === 0" class="sub-text">暂无日志</div>
               </div>
-              <div v-if="taskLogs[task.id].length === 0" class="sub-text">暂无日志</div>
-            </div>
-            <a-button v-else size="mini" @click="loadLogs(task.id)">加载日志</a-button>
+              <div v-else class="sub-text">展开后会自动加载最近执行日志</div>
+            </a-spin>
           </a-collapse-item>
         </a-collapse>
       </div>
@@ -106,11 +117,13 @@ import {
 
 const tasks = ref<any[]>([])
 const taskLogs = ref<Record<number, any[]>>({})
+const logLoadingMap = ref<Record<number, boolean>>({})
 const loading = ref(false)
 const modalVisible = ref(false)
 const saving = ref(false)
 const editingTask = ref<any>(null)
 const freqMode = ref('auto')
+const taskError = ref('')
 
 const form = reactive({
   name: '', description: '', target_qq: '',
@@ -119,10 +132,14 @@ const form = reactive({
 
 async function loadTasks() {
   loading.value = true
+  taskError.value = ''
   try {
     const { data } = await taskApi.getTasks()
     tasks.value = data || []
-  } catch {} finally { loading.value = false }
+  } catch (error) {
+    tasks.value = []
+    taskError.value = getErrorMessage(error, '暂时无法读取任务列表，请稍后重试。')
+  } finally { loading.value = false }
 }
 
 function showCreateModal() {
@@ -147,6 +164,12 @@ async function saveTask() {
   if (!form.name || !form.description || !form.target_qq) {
     Message.warning('请填写必填项'); return
   }
+  if (freqMode.value === 'cron' && !form.cron_expr.trim()) {
+    Message.warning('请输入有效的 Cron 表达式'); return
+  }
+  if (freqMode.value === 'interval' && (!form.interval_minutes || form.interval_minutes < 5)) {
+    Message.warning('固定间隔至少为 5 分钟'); return
+  }
   saving.value = true
   const payload = {
     ...form,
@@ -169,11 +192,22 @@ async function saveTask() {
 }
 
 async function toggleTask(task: any) {
-  try { await taskApi.toggleTask(task.id) } catch { task.is_active = !task.is_active }
+  try {
+    await taskApi.toggleTask(task.id)
+  } catch (error) {
+    task.is_active = !task.is_active
+    Message.error(getErrorMessage(error, '切换任务状态失败，请稍后重试。'))
+  }
 }
 
 async function deleteTask(id: number) {
-  try { await taskApi.deleteTask(id); loadTasks() } catch {}
+  try {
+    await taskApi.deleteTask(id)
+    Message.success('任务已删除')
+    loadTasks()
+  } catch (error) {
+    Message.error(getErrorMessage(error, '删除任务失败，请稍后重试。'))
+  }
 }
 
 async function runNow(task: any) {
@@ -184,10 +218,46 @@ async function runNow(task: any) {
 }
 
 async function loadLogs(taskId: number) {
+  logLoadingMap.value = {
+    ...logLoadingMap.value,
+    [taskId]: true,
+  }
   try {
     const { data } = await taskApi.getLogs(taskId)
-    taskLogs.value[taskId] = data || []
-  } catch {}
+    taskLogs.value = {
+      ...taskLogs.value,
+      [taskId]: data || [],
+    }
+  } catch (error) {
+    Message.error(getErrorMessage(error, '任务日志加载失败，请稍后重试。'))
+  } finally {
+    logLoadingMap.value = {
+      ...logLoadingMap.value,
+      [taskId]: false,
+    }
+  }
+}
+
+function handleLogsExpand(taskId: number, activeKeys: string | number | Array<string | number>) {
+  const isExpanded = Array.isArray(activeKeys) ? activeKeys.includes(taskId) : activeKeys === taskId
+  if (isExpanded && !taskLogs.value[taskId] && !logLoadingMap.value[taskId]) {
+    void loadLogs(taskId)
+  }
+}
+
+function getErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message) {
+    return error.message
+  }
+
+  if (typeof error === 'object' && error && 'response' in error) {
+    const detail = (error as any).response?.data?.detail
+    if (typeof detail === 'string' && detail) {
+      return detail
+    }
+  }
+
+  return fallback
 }
 
 function formatTime(t: string | null) {

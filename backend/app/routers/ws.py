@@ -4,6 +4,8 @@ import logging
 import asyncio
 import base64
 
+from app.security import get_admin_ws_accept_subprotocol, require_admin_websocket, require_napcat_websocket
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
@@ -16,6 +18,7 @@ active_preview_platforms: set[str] = set()
 
 @router.websocket("/ws/napcat")
 async def napcat_ws(websocket: WebSocket):
+    await require_napcat_websocket(websocket)
     await websocket.accept()
     conn_id = None
     client_info = f"{websocket.client.host}:{websocket.client.port}" if websocket.client else "unknown"
@@ -100,7 +103,8 @@ async def napcat_ws(websocket: WebSocket):
 @router.websocket("/ws/client")
 async def client_ws(websocket: WebSocket):
     """前端WebSocket，用于实时推送状态更新"""
-    await websocket.accept()
+    await require_admin_websocket(websocket)
+    await websocket.accept(subprotocol=get_admin_ws_accept_subprotocol(websocket))
     from app.services.napcat_client import napcat_client
     napcat_client.add_frontend_client(websocket)
     send_lock = asyncio.Lock()
@@ -161,7 +165,8 @@ async def browser_preview_ws(websocket: WebSocket):
       {"type": "status", "status": "...", "detail": "..."}
       {"type": "closed", "reason": "..."}
     """
-    await websocket.accept()
+    await require_admin_websocket(websocket)
+    await websocket.accept(subprotocol=get_admin_ws_accept_subprotocol(websocket))
     platform = None
     stream_task = None
 

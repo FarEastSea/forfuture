@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     backend_host: str = "0.0.0.0"
     backend_port: int = 18100
     secret_key: str = "change-me-to-a-random-string"
+    admin_api_token: str = ""
 
     # NapCat
     napcat_ws_url: str = "ws://127.0.0.1:3001"

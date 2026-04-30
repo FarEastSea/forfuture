@@ -3,9 +3,132 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db
 from app.models.ai_task import AITask, TaskLog
-from app.schemas import AITaskCreate, AITaskOut, TaskLogOut
+from app.schemas import AITaskCreate
+from app.security import require_admin_http
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_admin_http)])
+
+
+def _validate_cron_expr(cron_expr: str) -> str:
+    from apscheduler.triggers.cron import CronTrigger
+
+    normalized = cron_expr.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Cron 表达式不能为空。")
+
+    try:
+        CronTrigger.from_crontab(normalized)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"无效的 Cron 表达式: {exc}") from exc
+
+    return normalized
+
+
+async def _validate_notify_target(db: AsyncSession, target_qq: str) -> str:
+    normalized_target = target_qq or "admin"
+    if normalized_target == "admin":
+        return normalized_target
+
+    from app.models.account import Account
+    from app.models.system_config import SystemConfig
+
+    check_result = await db.execute(
+        select(Account).where(
+            Account.platform == "qq",
+            Account.is_target == 1,
+            Account.account_id == normalized_target,
+        )
+    )
+    if not check_result.scalar_one_or_none():
+        return normalized_target
+
+    allow_result = await db.execute(
+        select(SystemConfig).where(SystemConfig.key == "allow_send_to_monitored")
+    )
+    allow_cfg = allow_result.scalar_one_or_none()
+    if allow_cfg and allow_cfg.value == "true":
+        return normalized_target
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"安全拦截：QQ {normalized_target} 是被监控账号，禁止将其设为通知目标。",
+    )
+
+
+async def _resolve_task_config(req: AITaskCreate, db: AsyncSession) -> dict[str, object]:
+    from app.services.ai_service import ai_service
+
+    task_analysis = await ai_service.parse_task_type_and_interval(req.description)
+    task_type = req.task_type or task_analysis.get("task_type", "recurring")
+
+    cron_expr = req.cron_expr.strip() if req.cron_expr else None
+    interval_minutes = req.interval_minutes
+    ai_suggested = task_analysis.get("suggested_interval_minutes")
+    if not isinstance(ai_suggested, int):
+        ai_suggested = None
+
+    if cron_expr:
+        cron_expr = _validate_cron_expr(cron_expr)
+        interval_minutes = None
+    elif interval_minutes is not None:
+        if interval_minutes < 5:
+            raise HTTPException(status_code=400, detail="固定间隔至少为 5 分钟。")
+        cron_expr = None
+    else:
+        cron_expr = task_analysis.get("cron_expr")
+        if cron_expr:
+            cron_expr = _validate_cron_expr(cron_expr)
+            interval_minutes = None
+        else:
+            interval_minutes = ai_suggested or 120
+
+    target_qq = await _validate_notify_target(db, req.target_qq or "admin")
+
+    return {
+        "task_type": task_type,
+        "cron_expr": cron_expr,
+        "interval_minutes": interval_minutes,
+        "ai_suggested_interval": ai_suggested,
+        "target_qq": target_qq,
+    }
+
+
+async def _resolve_updated_task_config(req: AITaskCreate, task: AITask, db: AsyncSession) -> dict[str, object]:
+    from app.services.ai_service import ai_service
+
+    cron_expr = req.cron_expr.strip() if req.cron_expr else None
+    interval_minutes = req.interval_minutes
+    ai_suggested = task.ai_suggested_interval
+
+    if cron_expr:
+        cron_expr = _validate_cron_expr(cron_expr)
+        interval_minutes = None
+    elif interval_minutes is not None:
+        if interval_minutes < 5:
+            raise HTTPException(status_code=400, detail="固定间隔至少为 5 分钟。")
+        cron_expr = None
+    else:
+        task_analysis = await ai_service.parse_task_type_and_interval(req.description)
+        inferred_cron = task_analysis.get("cron_expr")
+        suggested_interval = task_analysis.get("suggested_interval_minutes")
+        if isinstance(suggested_interval, int):
+            ai_suggested = suggested_interval
+        if inferred_cron:
+            cron_expr = _validate_cron_expr(inferred_cron)
+            interval_minutes = None
+        else:
+            cron_expr = None
+            interval_minutes = ai_suggested or 120
+
+    target_qq = await _validate_notify_target(db, req.target_qq or "admin")
+
+    return {
+        "task_type": req.task_type or task.task_type or "recurring",
+        "cron_expr": cron_expr,
+        "interval_minutes": interval_minutes,
+        "ai_suggested_interval": ai_suggested,
+        "target_qq": target_qq,
+    }
 
 
 @router.get("")
@@ -34,56 +157,16 @@ async def get_tasks(db: AsyncSession = Depends(get_db)):
 
 @router.post("")
 async def create_task(req: AITaskCreate, db: AsyncSession = Depends(get_db)):
-    from app.services.ai_service import ai_service
-
-    # === AI分析任务类型和频率 ===
-    task_analysis = await ai_service.parse_task_type_and_interval(req.description)
-    task_type = req.task_type if req.task_type != "recurring" else task_analysis.get("task_type", "recurring")
-
-    # === 解析cron / interval ===
-    cron_expr = req.cron_expr
-    interval_minutes = req.interval_minutes
-    ai_suggested = task_analysis.get("suggested_interval_minutes")
-
-    if not cron_expr and not interval_minutes:
-        cron_expr = task_analysis.get("cron_expr")
-        if not cron_expr:
-            interval_minutes = ai_suggested or 120
-
-    # === 通知目标 ===
-    target_qq = req.target_qq or "admin"
-
-    # === 安全校验：不允许将目标设为被监控账号 ===
-    if target_qq != "admin":
-        from app.models.account import Account
-        from app.models.system_config import SystemConfig
-        check_result = await db.execute(
-            select(Account).where(
-                Account.platform == "qq",
-                Account.is_target == 1,
-                Account.account_id == target_qq
-            )
-        )
-        if check_result.scalar_one_or_none():
-            # 检查是否允许
-            allow_result = await db.execute(
-                select(SystemConfig).where(SystemConfig.key == "allow_send_to_monitored")
-            )
-            allow_cfg = allow_result.scalar_one_or_none()
-            if not (allow_cfg and allow_cfg.value == "true"):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"安全拦截：QQ {target_qq} 是被监控账号，禁止将其设为通知目标。"
-                )
+    resolved_config = await _resolve_task_config(req, db)
 
     task = AITask(
         name=req.name,
         description=req.description,
-        target_qq=target_qq,
-        task_type=task_type,
-        cron_expr=cron_expr,
-        interval_minutes=interval_minutes,
-        ai_suggested_interval=ai_suggested,
+        target_qq=resolved_config["target_qq"],
+        task_type=resolved_config["task_type"],
+        cron_expr=resolved_config["cron_expr"],
+        interval_minutes=resolved_config["interval_minutes"],
+        ai_suggested_interval=resolved_config["ai_suggested_interval"],
         message_format=req.message_format,
     )
     db.add(task)
@@ -94,13 +177,14 @@ async def create_task(req: AITaskCreate, db: AsyncSession = Depends(get_db)):
     from app.services.task_scheduler import scheduler_service
     scheduler_service.register_task(task)
 
+    task_type = str(resolved_config["task_type"])
     type_label = {"temporal": "时效性/事件驱动", "recurring": "定期检查", "oneoff": "一次性"}.get(task_type, task_type)
     return {
         "id": task.id,
         "task_type": task_type,
-        "cron_expr": cron_expr,
-        "interval_minutes": interval_minutes,
-        "ai_suggested_interval": ai_suggested,
+        "cron_expr": resolved_config["cron_expr"],
+        "interval_minutes": resolved_config["interval_minutes"],
+        "ai_suggested_interval": resolved_config["ai_suggested_interval"],
         "message": f"任务创建成功（类型: {type_label}）"
     }
 
@@ -112,16 +196,25 @@ async def update_task(task_id: int, req: AITaskCreate, db: AsyncSession = Depend
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 
+    resolved_config = await _resolve_updated_task_config(req, task, db)
+
     task.name = req.name
     task.description = req.description
-    task.target_qq = req.target_qq
-    task.cron_expr = req.cron_expr or task.cron_expr
-    task.interval_minutes = req.interval_minutes
+    task.target_qq = resolved_config["target_qq"]
+    task.task_type = resolved_config["task_type"]
+    task.cron_expr = resolved_config["cron_expr"]
+    task.interval_minutes = resolved_config["interval_minutes"]
+    task.ai_suggested_interval = resolved_config["ai_suggested_interval"]
     task.message_format = req.message_format
+    if task.task_type != "temporal":
+        task.last_checked_until = None
     await db.commit()
 
     from app.services.task_scheduler import scheduler_service
-    scheduler_service.update_task(task)
+    if task.is_active:
+        scheduler_service.update_task(task)
+    else:
+        scheduler_service.remove_task(task_id)
 
     return {"message": "更新成功"}
 

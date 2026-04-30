@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from fastapi.responses import StreamingResponse
-from app.database import get_db
+from app.database import get_db, async_session
 from app.models.chat_history import ChatSession, ChatMessage
 from app.schemas import ChatMessageCreate, ChatSessionOut
 
@@ -112,7 +112,7 @@ async def send_message(session_id: int, req: ChatMessageCreate, db: AsyncSession
             full_response = f"[错误] {str(e)}"
 
         # 保存AI回复
-        async with get_db_session() as save_db:
+        async with async_session() as save_db:
             ai_msg = ChatMessage(
                 session_id=session_id,
                 role="assistant",
@@ -130,8 +130,3 @@ async def send_message(session_id: int, req: ChatMessageCreate, db: AsyncSession
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
-
-
-async def get_db_session():
-    from app.database import async_session
-    return async_session()

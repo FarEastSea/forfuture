@@ -19,6 +19,14 @@
       </div>
     </div>
 
+    <div v-if="postsError" class="inline-state-card error compact">
+      <div>
+        <strong>动态列表加载失败</strong>
+        <p>{{ postsError }}</p>
+      </div>
+      <a-button size="small" type="outline" @click="loadPosts">重新加载</a-button>
+    </div>
+
     <div v-if="crawlStatus" class="crawl-status">
       <a-alert :type="crawlStatus.error ? 'error' : crawlStatus.running ? 'info' : 'success'" :closable="!crawlStatus.running">
         <template #title v-if="crawlStatus.error">抓取错误</template>
@@ -35,10 +43,11 @@
 
     <div class="timeline-container">
       <a-spin :loading="loading" tip="加载中..." style="width: 100%">
-        <div v-if="posts.length === 0 && !loading" class="empty-state">
+        <div v-if="posts.length === 0 && !loading && !postsError" class="empty-state">
           <icon-empty :size="48" />
           <p>暂无动态记录</p>
           <p class="sub-text">请先在设置中添加要监控的QQ号，然后点击"抓取动态"</p>
+          <a-button type="outline" :disabled="!accounts.length" @click="startCrawl">立即抓取</a-button>
         </div>
 
         <div v-for="post in posts" :key="post.id" class="post-card">
@@ -126,7 +135,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
+import { Message } from '@arco-design/web-vue'
 import { qqApi } from '@/api'
 import { IconSync, IconHeart, IconMessage, IconEmpty } from '@arco-design/web-vue/es/icon'
 
@@ -135,22 +145,27 @@ const accounts = ref<any[]>([])
 const selectedQQ = ref<string>('')
 const loading = ref(false)
 const crawling = ref(false)
+const postsError = ref('')
 const crawlMode = ref('incremental')
 const crawlStatus = ref<any>(null)
 const page = ref(1)
 const pageSize = 20
 const total = ref(0)
+let crawlStatusTimer: ReturnType<typeof setInterval> | null = null
 
 async function loadPosts() {
   loading.value = true
+  postsError.value = ''
   try {
     const params: any = { page: page.value, page_size: pageSize }
     if (selectedQQ.value) params.qq_number = selectedQQ.value
     const { data } = await qqApi.getPosts(params)
     posts.value = data.items || []
     total.value = data.total || 0
-  } catch (e) {
-    console.error(e)
+  } catch (error) {
+    posts.value = []
+    total.value = 0
+    postsError.value = getErrorMessage(error, '暂时无法读取动态列表，请稍后重试。')
   } finally {
     loading.value = false
   }
@@ -160,13 +175,14 @@ async function loadAccounts() {
   try {
     const { data } = await qqApi.getAccounts()
     accounts.value = data || []
-  } catch {}
+  } catch (error) {
+    Message.error(getErrorMessage(error, '监控账号加载失败，请检查设置页配置。'))
+  }
 }
 
 async function startCrawl() {
   const ids = accounts.value.map((a: any) => a.account_id)
   if (ids.length === 0) {
-    const { Message } = await import('@arco-design/web-vue')
     Message.warning('请先在设置中添加要监控的QQ号')
     return
   }
@@ -174,26 +190,60 @@ async function startCrawl() {
   try {
     await qqApi.crawl(ids, crawlMode.value)
     pollCrawlStatus()
-  } catch (e: any) {
+  } catch (error) {
     crawling.value = false
+    crawlStatus.value = {
+      error: getErrorMessage(error, 'QQ 抓取任务启动失败，请稍后再试。'),
+      running: false,
+    }
+    Message.error(crawlStatus.value.error)
   }
 }
 
 async function pollCrawlStatus() {
-  const interval = setInterval(async () => {
+  if (crawlStatusTimer) {
+    clearInterval(crawlStatusTimer)
+  }
+
+  crawlStatusTimer = setInterval(async () => {
     try {
       const { data } = await qqApi.getCrawlStatus()
       crawlStatus.value = data
       if (!data.running) {
-        clearInterval(interval)
+        if (crawlStatusTimer) {
+          clearInterval(crawlStatusTimer)
+          crawlStatusTimer = null
+        }
         crawling.value = false
-        loadPosts()
+        void loadPosts()
       }
-    } catch {
-      clearInterval(interval)
+    } catch (error) {
+      if (crawlStatusTimer) {
+        clearInterval(crawlStatusTimer)
+        crawlStatusTimer = null
+      }
       crawling.value = false
+      crawlStatus.value = {
+        error: getErrorMessage(error, 'QQ 抓取状态更新失败，请稍后手动刷新。'),
+        running: false,
+      }
     }
   }, 2000)
+}
+
+function getErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message) {
+    return error.message
+  }
+
+  if (typeof error === 'object' && error && 'response' in error) {
+    const detail = (error as any).response?.data?.detail
+    if (typeof detail === 'string' && detail) {
+      return detail
+    }
+  }
+
+  return fallback
 }
 
 function formatTime(t: string | null) {
@@ -254,5 +304,11 @@ function getCurrentNickname(post: any): string {
 onMounted(() => {
   loadAccounts()
   loadPosts()
+})
+
+onUnmounted(() => {
+  if (crawlStatusTimer) {
+    clearInterval(crawlStatusTimer)
+  }
 })
 </script>

@@ -3,9 +3,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db
 from app.models.ai_config import AIConfig
-from app.schemas import AIConfigCreate, AIConfigOut
+from app.schemas import AIConfigCreate, AIConfigUpdate
+from app.security import require_admin_http
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_admin_http)])
 
 
 @router.get("")
@@ -15,8 +16,7 @@ async def get_configs(db: AsyncSession = Depends(get_db)):
     return [
         {
             "id": c.id, "name": c.name, "api_base": c.api_base,
-            "api_key": c.api_key[:8] + "***" if c.api_key else "",
-            "api_key_full": c.api_key,
+            "api_key": f"{c.api_key[:4]}...{c.api_key[-4:]}" if c.api_key and len(c.api_key) > 8 else (c.api_key[:2] + "****" if c.api_key else ""),
             "model": c.model, "embed_model": c.embed_model,
             "max_tokens": c.max_tokens, "temperature": c.temperature,
             "is_active": c.is_active,
@@ -40,7 +40,7 @@ async def create_config(req: AIConfigCreate, db: AsyncSession = Depends(get_db))
 
 
 @router.put("/{config_id}")
-async def update_config(config_id: int, req: AIConfigCreate, db: AsyncSession = Depends(get_db)):
+async def update_config(config_id: int, req: AIConfigUpdate, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(AIConfig).where(AIConfig.id == config_id))
     config = result.scalar_one_or_none()
     if not config:
@@ -48,7 +48,8 @@ async def update_config(config_id: int, req: AIConfigCreate, db: AsyncSession = 
 
     config.name = req.name
     config.api_base = req.api_base
-    config.api_key = req.api_key
+    if req.api_key:
+        config.api_key = req.api_key
     config.model = req.model
     config.embed_model = req.embed_model
     config.max_tokens = req.max_tokens

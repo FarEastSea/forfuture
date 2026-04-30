@@ -776,10 +776,15 @@ class QQCrawler:
                     break
         await self._cleanup_browser()
 
-    async def _save_login_cookies(self, cookies: list[dict]):
+    async def _save_login_cookies(
+        self,
+        cookies: list[dict],
+        login_account_id: int | None = None,
+    ):
         """将QQ空间登录Cookie保存到数据库Account表。确保包含p_skey。"""
         from app.database import async_session
         from app.models.account import Account
+        from app.services.account_risk_service import mark_account_verified
         from sqlalchemy import select
 
         # 检查是否包含p_skey（QQ空间API必须的cookie）
@@ -836,28 +841,50 @@ class QQCrawler:
                     qq_number = val
 
         async with async_session() as db:
-            # 查找已有的QQ登录账号（is_target=0 表示是登录用账号）
-            result = await db.execute(
-                select(Account)
-                .where(Account.platform == "qq", Account.is_target == 0)
-                .order_by(Account.last_login.desc(), Account.id.desc())
-            )
-            account = result.scalars().first()
+            account = None
+            if login_account_id is not None:
+                result = await db.execute(
+                    select(Account).where(
+                        Account.id == login_account_id,
+                        Account.platform == "qq",
+                        Account.is_target == 0,
+                    )
+                )
+                account = result.scalars().first()
+
+            if account is None and qq_number:
+                result = await db.execute(
+                    select(Account).where(
+                        Account.platform == "qq",
+                        Account.account_id == qq_number,
+                        Account.is_target == 0,
+                    )
+                )
+                account = result.scalars().first()
+
+            if account is None:
+                result = await db.execute(
+                    select(Account)
+                    .where(Account.platform == "qq", Account.is_target == 0)
+                    .order_by(Account.last_login.desc(), Account.id.desc())
+                )
+                account = result.scalars().first()
+
             if account:
                 account.cookies = json.dumps(cookies)
-                account.status = "active"
                 account.last_login = datetime.now()
                 if qq_number:
                     account.account_id = qq_number
+                mark_account_verified(account)
             else:
                 account = Account(
                     platform="qq",
                     account_id=qq_number or "qq_login",
                     cookies=json.dumps(cookies),
-                    status="active",
                     is_target=0,
                     last_login=datetime.now(),
                 )
+                mark_account_verified(account)
                 db.add(account)
             await db.commit()
             logger.info(f"QQ空间登录Cookie已保存（QQ={qq_number or '未知'}）")
@@ -903,10 +930,9 @@ class QQCrawler:
                 )
                 login_accounts = login_result.scalars().all()
                 if login_accounts:
-                    # 如果所有登录账号都非active（disabled/expired），跳过通知
-                    has_active = any(a.status == "active" for a in login_accounts)
-                    if not has_active:
-                        logger.debug(f"{platform}所有登录账号均非active，跳过过期通知")
+                    has_non_disabled = any(a.status != "disabled" for a in login_accounts)
+                    if not has_non_disabled:
+                        logger.debug(f"{platform}所有登录账号均已禁用，跳过过期通知")
                         return
 
                 result = await db.execute(
@@ -1142,6 +1168,8 @@ class QQCrawler:
 
             # 保存到数据库
             async with async_session() as db:
+                from app.services.account_risk_service import mark_account_verified
+
                 # 查找已有的NapCat登录账号（通过QQ号匹配）
                 existing = None
                 if qq_number:
@@ -1157,10 +1185,10 @@ class QQCrawler:
                 # 只精确匹配QQ号：找到则更新，找不到则新增（不覆盖其他账号）
                 if existing:
                     existing.cookies = json.dumps(parsed_cookies)
-                    existing.status = "active"
                     existing.last_login = datetime.now()
                     if nickname:
                         existing.nickname = nickname
+                    mark_account_verified(existing)
                     logger.info(f"NapCat登录: 更新已有QQ登录账号 id={existing.id}, QQ={qq_number}")
                 else:
                     new_account = Account(
@@ -1168,10 +1196,10 @@ class QQCrawler:
                         account_id=qq_number or "napcat",
                         nickname=nickname,
                         cookies=json.dumps(parsed_cookies),
-                        status="active",
                         is_target=0,
                         last_login=datetime.now(),
                     )
+                    mark_account_verified(new_account)
                     db.add(new_account)
                     logger.info(f"NapCat登录: 创建新QQ登录账号 QQ={qq_number}")
 
@@ -1201,36 +1229,71 @@ class QQCrawler:
 
     # ===================== Cookie自动续期 =====================
 
-    async def refresh_qq_cookies(self) -> bool:
+    async def _load_login_account(
+        self,
+        login_account_id: int | None = None,
+        *,
+        require_cookies: bool = False,
+        allow_degraded: bool = False,
+    ):
+        from app.database import async_session
+        from app.models.account import Account
+        from app.services.account_risk_service import get_preferred_login_account, is_login_account_eligible
+        from sqlalchemy import select
+
+        async with async_session() as db:
+            if login_account_id is not None:
+                result = await db.execute(
+                    select(Account).where(
+                        Account.id == login_account_id,
+                        Account.platform == "qq",
+                        Account.is_target == 0,
+                    )
+                )
+                account = result.scalars().first()
+                if account and is_login_account_eligible(
+                    account,
+                    require_cookies=require_cookies,
+                    allow_degraded=allow_degraded,
+                ):
+                    return account
+                return None
+
+            return await get_preferred_login_account(
+                db,
+                "qq",
+                require_cookies=require_cookies,
+                allow_degraded=allow_degraded,
+            )
+
+    async def refresh_qq_cookies(
+        self,
+        login_account_id: int | None = None,
+        *,
+        allow_degraded: bool = False,
+    ) -> bool:
         """通过Playwright访问QQ空间，自动刷新/续期cookies。
         
         原理：用现有cookies加载QQ空间页面，QQ服务器会自动续期session。
         刷新后提取新cookies保存到数据库。
         返回True=续期成功，False=cookies已失效需重新登录。
         """
-        from app.database import async_session
-        from app.models.account import Account
-        from sqlalchemy import select
+        account = await self._load_login_account(
+            login_account_id,
+            require_cookies=True,
+            allow_degraded=allow_degraded,
+        )
+        if not account or not account.cookies:
+            logger.info("QQ Cookie续期：无登录账号")
+            return False
 
-        # 获取当前cookies
-        async with async_session() as db:
-            result = await db.execute(
-                select(Account)
-                .where(Account.platform == "qq", Account.status == "active", Account.is_target == 0)
-                .order_by(Account.last_login.desc(), Account.id.desc())
-            )
-            account = result.scalars().first()
-            if not account or not account.cookies:
-                logger.info("QQ Cookie续期：无登录账号")
-                return False
+        try:
+            old_cookies = json.loads(account.cookies)
+        except Exception:
+            logger.warning("QQ Cookie续期：Cookie解析失败")
+            return False
 
-            try:
-                old_cookies = json.loads(account.cookies)
-            except Exception:
-                logger.warning("QQ Cookie续期：Cookie解析失败")
-                return False
-
-            last_login = account.last_login
+        last_login = account.last_login
 
         # 检查上次登录时间，如果不到1小时则不需要刷新
         if last_login:
@@ -1346,7 +1409,7 @@ class QQCrawler:
                 logger.debug(f"QQ Cookie续期验证异常（非致命）: {e}")
 
             # 保存刷新后的cookies
-            await self._save_login_cookies(new_cookies)
+            await self._save_login_cookies(new_cookies, login_account_id=account.id)
             logger.info(f"QQ Cookie续期成功（{len(new_cookies)}个cookie）")
             return True
 
@@ -1367,21 +1430,49 @@ class QQCrawler:
 
     # ===================== QQ空间 HTTP API 爬取 =====================
 
-    async def start_crawl(self, qq_numbers: list[str], mode: str = "incremental") -> str:
+    async def start_crawl(
+        self,
+        qq_numbers: list[str],
+        mode: str = "incremental",
+        login_account_id: int | None = None,
+        allow_degraded_login: bool = False,
+    ) -> str:
         task_id = uuid.uuid4().hex[:8]
         self._status = {"running": True, "task_id": task_id, "progress": "启动中...", "error": None, "details": []}
         self._crawl_mode = mode  # "incremental" or "overwrite"
         self._log(f"QQ抓取任务启动: task_id={task_id}, QQ号={qq_numbers}, 模式={mode}")
-        asyncio.create_task(self._crawl_task(qq_numbers, task_id))
+        asyncio.create_task(
+            self._crawl_task(
+                qq_numbers,
+                task_id,
+                login_account_id=login_account_id,
+                allow_degraded_login=allow_degraded_login,
+            )
+        )
         return task_id
 
-    async def _crawl_task(self, qq_numbers: list[str], task_id: str):
+    async def _crawl_task(
+        self,
+        qq_numbers: list[str],
+        task_id: str,
+        *,
+        login_account_id: int | None = None,
+        allow_degraded_login: bool = False,
+    ):
         try:
             self._log("尝试QQ空间HTTP API抓取")
-            api_ok = await self._crawl_via_api(qq_numbers)
+            api_ok = await self._crawl_via_api(
+                qq_numbers,
+                login_account_id=login_account_id,
+                allow_degraded_login=allow_degraded_login,
+            )
             if not api_ok:
                 self._log("HTTP API抓取失败，降级到Playwright浏览器抓取", "warning")
-                await self._crawl_via_playwright(qq_numbers)
+                await self._crawl_via_playwright(
+                    qq_numbers,
+                    login_account_id=login_account_id,
+                    allow_degraded_login=allow_degraded_login,
+                )
             if not self._status.get("error"):
                 self._status["progress"] = "完成"
                 self._log("抓取任务完成")
@@ -1392,56 +1483,63 @@ class QQCrawler:
         finally:
             self._status["running"] = False
 
-    async def _get_login_cookies_and_token(self) -> tuple[dict, int, str] | None:
+    async def _get_login_cookies_and_token(
+        self,
+        login_account_id: int | None = None,
+        *,
+        allow_degraded: bool = False,
+    ) -> tuple[dict, int, str] | None:
         """从数据库获取QQ登录Cookie和g_tk token。返回 (cookies_dict, g_tk, uin)"""
-        from app.database import async_session
-        from app.models.account import Account
-        from sqlalchemy import select
+        account = await self._load_login_account(
+            login_account_id,
+            require_cookies=True,
+            allow_degraded=allow_degraded,
+        )
+        if not account or not account.cookies:
+            return None
 
-        async with async_session() as db:
-            result = await db.execute(
-                select(Account)
-                .where(Account.platform == "qq", Account.status == "active", Account.is_target == 0)
-                .order_by(Account.last_login.desc(), Account.id.desc())
-            )
-            account = result.scalars().first()
-            if not account or not account.cookies:
-                return None
+        cookies_list = json.loads(account.cookies)
+        cookies_dict = {}
+        p_skey = ""
+        skey = ""
+        pt_key = ""
+        uin = ""
 
-            cookies_list = json.loads(account.cookies)
-            cookies_dict = {}
-            p_skey = ""
-            skey = ""
-            pt_key = ""
-            uin = ""
+        for c in cookies_list:
+            name = c.get("name", "")
+            value = c.get("value", "")
+            cookies_dict[name] = value
+            if name == "p_skey" and value:
+                p_skey = value
+            if name == "skey" and value:
+                skey = value
+            if name == "pt_key" and value:
+                pt_key = value
+            if name == "uin":
+                uin = value.lstrip("o0")
 
-            for c in cookies_list:
-                name = c.get("name", "")
-                value = c.get("value", "")
-                cookies_dict[name] = value
-                if name == "p_skey" and value:
-                    p_skey = value
-                if name == "skey" and value:
-                    skey = value
-                if name == "pt_key" and value:
-                    pt_key = value
-                if name == "uin":
-                    uin = value.lstrip("o0")
+        token_key = p_skey or skey or pt_key
+        if not token_key:
+            self._log("QQ Cookie中无p_skey/skey/pt_key，无法计算g_tk", "warning")
+            return None
 
-            # 优先使用p_skey, 其次skey, 再次pt_key
-            token_key = p_skey or skey or pt_key
-            if not token_key:
-                self._log("QQ Cookie中无p_skey/skey/pt_key，无法计算g_tk", "warning")
-                return None
+        g_tk = compute_g_tk(token_key)
+        used_key = "p_skey" if p_skey else ("skey" if skey else "pt_key")
+        self._log(f"已加载QQ Cookie（uin={uin}, g_tk={g_tk}, 使用{used_key}）")
+        return cookies_dict, g_tk, uin
 
-            g_tk = compute_g_tk(token_key)
-            used_key = "p_skey" if p_skey else ("skey" if skey else "pt_key")
-            self._log(f"已加载QQ Cookie（uin={uin}, g_tk={g_tk}, 使用{used_key}）")
-            return cookies_dict, g_tk, uin
-
-    async def _crawl_via_api(self, qq_numbers: list[str]) -> bool:
+    async def _crawl_via_api(
+        self,
+        qq_numbers: list[str],
+        *,
+        login_account_id: int | None = None,
+        allow_degraded_login: bool = False,
+    ) -> bool:
         """通过QQ空间HTTP JSON API抓取说说。返回True表示成功（至少部分成功）"""
-        creds = await self._get_login_cookies_and_token()
+        creds = await self._get_login_cookies_and_token(
+            login_account_id,
+            allow_degraded=allow_degraded_login,
+        )
         if not creds:
             self._log("⚠ 没有找到已登录的QQ账号Cookie，HTTP API不可用", "warning")
             return False
@@ -1848,7 +1946,13 @@ class QQCrawler:
 
     # ===================== Playwright DOM 解析（备用方案）=====================
 
-    async def _crawl_via_playwright(self, qq_numbers: list[str]):
+    async def _crawl_via_playwright(
+        self,
+        qq_numbers: list[str],
+        *,
+        login_account_id: int | None = None,
+        allow_degraded_login: bool = False,
+    ):
         """通过Playwright浏览器自动化抓取QQ空间（备用方案）"""
         try:
             from playwright.async_api import async_playwright
@@ -1857,11 +1961,8 @@ class QQCrawler:
             self._status["error"] = "HTTP API和Playwright均不可用"
             return
 
-        from app.database import async_session
         from app.models.qq_post import QQPost
-        from app.models.account import Account
         from app.services.media_service import media_service
-        from sqlalchemy import select
 
         self._log("正在启动Playwright浏览器（备用模式）...")
         try:
@@ -1874,21 +1975,18 @@ class QQCrawler:
         try:
             browser = await pw.chromium.launch(headless=True)
 
-            # 获取登录Cookie
-            async with async_session() as db:
-                result = await db.execute(
-                    select(Account)
-                    .where(Account.platform == "qq", Account.status == "active", Account.is_target == 0)
-                    .order_by(Account.last_login.desc(), Account.id.desc())
-                )
-                account = result.scalars().first()
-                cookies = None
-                if account and account.cookies:
-                    cookies = json.loads(account.cookies)
-                    self._log(f"已加载QQ Cookie（账号: {account.account_id}）")
-                else:
-                    self._log("⚠ 无QQ登录Cookie，Playwright模式可能无法访问空间", "warning")
-                    self._status["error"] = "未登录QQ：请先扫码登录QQ空间。"
+            account = await self._load_login_account(
+                login_account_id,
+                require_cookies=False,
+                allow_degraded=allow_degraded_login,
+            )
+            cookies = None
+            if account and account.cookies:
+                cookies = json.loads(account.cookies)
+                self._log(f"已加载QQ Cookie（账号: {account.account_id}）")
+            else:
+                self._log("⚠ 无QQ登录Cookie，Playwright模式可能无法访问空间", "warning")
+                self._status["error"] = "未登录QQ：请先扫码登录QQ空间。"
 
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"

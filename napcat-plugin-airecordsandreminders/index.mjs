@@ -5,9 +5,10 @@ import os from 'os';
 
 // ===== WebSocket 客户端 =====
 class WSClient {
-  constructor(url, logger) {
+  constructor(url, logger, backendToken = '') {
     this.url = url;
     this.logger = logger;
+    this.backendToken = backendToken;
     this.ws = null;
     this.reconnectDelay = 3000;
     this.maxReconnectDelay = 60000;
@@ -52,6 +53,7 @@ class WSClient {
         this.logger.info(`[AI-Monitor][WS] 正在连接: ${this.url}`);
         this.ws = new WebSocket(this.url, {
           handshakeTimeout: 10000,
+          headers: this.backendToken ? { 'X-NapCat-Token': this.backendToken } : undefined,
           // 允许自签名证书
           rejectUnauthorized: false,
         });
@@ -165,6 +167,16 @@ class WSClient {
 
   onMessage(callback) { this.callbacks.push(callback); }
   get connected() { return this.ws && this.ws.readyState === WebSocket.OPEN; }
+}
+
+function resolveBackendToken(config) {
+  return String(
+    config.backendToken ||
+    process.env.AI_RECORDS_BACKEND_TOKEN ||
+    process.env.ADMIN_API_TOKEN ||
+    process.env.SECRET_KEY ||
+    ''
+  ).trim();
 }
 
 // ===== 渲染器 =====
@@ -311,6 +323,7 @@ async function handleBackendMessage(ctx, wsClient, msg, logger) {
 // ===== 插件全局状态 =====
 const DEFAULT_CONFIG = {
   backendWsUrl: 'ws://127.0.0.1:18100/ws/napcat',
+  backendToken: '',
   enabled: true,
 };
 
@@ -369,7 +382,7 @@ async function plugin_init(ctx) {
   logger.info(`[AI-Monitor] 初始QQ号: ${selfQQ}`);
 
   // 连接后端
-  wsClient = new WSClient(currentConfig.backendWsUrl, logger);
+  wsClient = new WSClient(currentConfig.backendWsUrl, logger, resolveBackendToken(currentConfig));
   await wsClient.connect(selfQQ);
   wsClient.onMessage((msg) => handleBackendMessage(ctx, wsClient, msg, logger));
 
@@ -412,10 +425,10 @@ function plugin_on_config_change(ctx, _, key, value) {
   } catch {}
 
   // 如果修改了后端地址，重连
-  if (key === 'backendWsUrl' && wsClient) {
+  if ((key === 'backendWsUrl' || key === 'backendToken') && wsClient) {
     wsClient.disconnect();
     const logger = ctx.logger || console;
-    wsClient = new WSClient(value, logger);
+    wsClient = new WSClient(currentConfig.backendWsUrl, logger, resolveBackendToken(currentConfig));
     fetchSelfQQ(ctx, logger).then(selfQQ => {
       wsClient.connect(selfQQ);
       wsClient.onMessage((msg) => handleBackendMessage(ctx, wsClient, msg, logger));
@@ -431,6 +444,7 @@ function buildConfigUI(ctx) {
     NapCatConfig.html('<h3>🤖 AI Records & Reminders</h3><p>与后端通信，实现AI监控推送</p>'),
     NapCatConfig.boolean('enabled', '启用插件', true, '是否启用此插件'),
     NapCatConfig.text('backendWsUrl', '后端WebSocket地址', DEFAULT_CONFIG.backendWsUrl, '后端服务的WebSocket地址'),
+    NapCatConfig.text('backendToken', '后端连接令牌', DEFAULT_CONFIG.backendToken, '优先与后端 napcat_token 保持一致；未单独配置时可改为与 ADMIN_API_TOKEN 或 SECRET_KEY 一致，留空则尝试读取同名环境变量'),
   );
 }
 

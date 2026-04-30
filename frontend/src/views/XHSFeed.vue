@@ -19,6 +19,14 @@
       </div>
     </div>
 
+    <div v-if="notesError" class="inline-state-card error compact">
+      <div>
+        <strong>笔记列表加载失败</strong>
+        <p>{{ notesError }}</p>
+      </div>
+      <a-button size="small" type="outline" @click="loadNotes">重新加载</a-button>
+    </div>
+
     <div v-if="crawlStatus" class="crawl-status">
       <a-alert :type="crawlStatus.error ? 'error' : 'info'">
         {{ crawlStatus.error || crawlStatus.progress || '空闲' }}
@@ -26,10 +34,11 @@
     </div>
 
     <a-spin :loading="loading" tip="加载中..." style="width: 100%">
-      <div v-if="notes.length === 0 && !loading" class="empty-state">
+      <div v-if="notes.length === 0 && !loading && !notesError" class="empty-state">
         <icon-empty :size="48" />
         <p>暂无笔记记录</p>
         <p class="sub-text">请先在设置中添加要监控的小红书账号，然后点击"抓取笔记"</p>
+        <a-button type="outline" :disabled="!accounts.length" @click="startCrawl">立即抓取</a-button>
       </div>
 
       <div class="xhs-grid">
@@ -84,7 +93,7 @@
         <div class="detail-video" v-if="detailNote.local_video_path || detailNote.video_url">
           <video
             controls
-            :src="detailNote.local_video_path || `/api/proxy/image?url=${encodeURIComponent(detailNote.video_url)}`"
+            :src="getXhsVideoSrc(detailNote)"
             style="width: 100%; max-height: 400px; border-radius: 8px; background: #000"
           ></video>
         </div>
@@ -118,6 +127,7 @@
             抓取评论
           </a-button>
         </div>
+        <p v-if="commentsFeedback" class="sub-text">{{ commentsFeedback }}</p>
         <div v-if="detailNote.comments && detailNote.comments.length" class="detail-comments">
           <div v-for="c in detailNote.comments" :key="c.id" class="comment-item">
             <div class="comment-main">
@@ -163,7 +173,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
+import { Message } from '@arco-design/web-vue'
 import { xhsApi } from '@/api'
 import { IconSync, IconHeart, IconStar, IconEmpty, IconImage, IconShareAlt, IconMessage } from '@arco-design/web-vue/es/icon'
 
@@ -172,6 +183,7 @@ const accounts = ref<any[]>([])
 const selectedUid = ref('')
 const loading = ref(false)
 const crawling = ref(false)
+const notesError = ref('')
 const crawlMode = ref('incremental')
 const crawlStatus = ref<any>(null)
 const page = ref(1)
@@ -180,43 +192,80 @@ const total = ref(0)
 const detailVisible = ref(false)
 const detailNote = ref<any>(null)
 const crawlingComments = ref(false)
+const commentsFeedback = ref('')
+let crawlStatusTimer: ReturnType<typeof setInterval> | null = null
+let commentsRefreshTimer: ReturnType<typeof setTimeout> | null = null
 
 async function loadNotes() {
   loading.value = true
+  notesError.value = ''
   try {
     const params: any = { page: page.value, page_size: pageSize }
     if (selectedUid.value) params.xhs_uid = selectedUid.value
     const { data } = await xhsApi.getNotes(params)
     notes.value = data.items || []
     total.value = data.total || 0
-  } catch {} finally { loading.value = false }
+  } catch (error) {
+    notes.value = []
+    total.value = 0
+    notesError.value = getErrorMessage(error, '暂时无法读取笔记列表，请稍后重试。')
+  } finally { loading.value = false }
 }
 
 async function loadAccounts() {
   try {
     const { data } = await xhsApi.getAccounts()
     accounts.value = data || []
-  } catch {}
+  } catch (error) {
+    Message.error(getErrorMessage(error, '监控账号加载失败，请检查设置页配置。'))
+  }
 }
 
 async function startCrawl() {
   const ids = accounts.value.map((a: any) => a.account_id)
   if (!ids.length) {
-    const { Message } = await import('@arco-design/web-vue')
     Message.warning('请先在设置中添加要监控的小红书账号')
     return
   }
   crawling.value = true
   try {
     await xhsApi.crawl(ids, crawlMode.value)
-    const interval = setInterval(async () => {
+    if (crawlStatusTimer) {
+      clearInterval(crawlStatusTimer)
+    }
+
+    crawlStatusTimer = setInterval(async () => {
       try {
         const { data } = await xhsApi.getCrawlStatus()
         crawlStatus.value = data
-        if (!data.running) { clearInterval(interval); crawling.value = false; loadNotes() }
-      } catch { clearInterval(interval); crawling.value = false }
+        if (!data.running) {
+          if (crawlStatusTimer) {
+            clearInterval(crawlStatusTimer)
+            crawlStatusTimer = null
+          }
+          crawling.value = false
+          void loadNotes()
+        }
+      } catch (error) {
+        if (crawlStatusTimer) {
+          clearInterval(crawlStatusTimer)
+          crawlStatusTimer = null
+        }
+        crawling.value = false
+        crawlStatus.value = {
+          error: getErrorMessage(error, '小红书抓取状态更新失败，请稍后手动刷新。'),
+          running: false,
+        }
+      }
     }, 2000)
-  } catch { crawling.value = false }
+  } catch (error) {
+    crawling.value = false
+    crawlStatus.value = {
+      error: getErrorMessage(error, '小红书抓取任务启动失败，请稍后再试。'),
+      running: false,
+    }
+    Message.error(crawlStatus.value.error)
+  }
 }
 
 async function showDetail(note: any) {
@@ -224,52 +273,98 @@ async function showDetail(note: any) {
     const { data } = await xhsApi.getNote(note.id)
     detailNote.value = data
     detailVisible.value = true
-  } catch { detailNote.value = note; detailVisible.value = true }
+    commentsFeedback.value = ''
+  } catch {
+    detailNote.value = note
+    detailVisible.value = true
+    commentsFeedback.value = ''
+  }
 }
 
 async function crawlNoteComments(note: any) {
   if (!note?.id) return
   crawlingComments.value = true
+  commentsFeedback.value = '评论抓取任务已提交，预计 15 秒内可刷新到最新内容。'
   try {
-    const { Message } = await import('@arco-design/web-vue')
     await xhsApi.crawlNoteComments(note.id)
-    Message.info('评论抓取任务已启动，请稍后刷新查看')
-    // 10秒后自动刷新详情
-    setTimeout(async () => {
+    Message.info('评论抓取任务已启动，系统会稍后自动刷新详情。')
+
+    if (commentsRefreshTimer) {
+      clearTimeout(commentsRefreshTimer)
+    }
+
+    commentsRefreshTimer = setTimeout(async () => {
       try {
         const { data } = await xhsApi.getNote(note.id)
         detailNote.value = data
-      } catch {}
+        commentsFeedback.value = '最新评论已自动刷新。'
+      } catch {
+        commentsFeedback.value = '评论抓取完成，但自动刷新失败，请手动重开详情查看。'
+      }
       crawlingComments.value = false
     }, 15000)
-  } catch {
+  } catch (error) {
     crawlingComments.value = false
+    commentsFeedback.value = ''
+    Message.error(getErrorMessage(error, '评论抓取任务启动失败，请稍后再试。'))
   }
 }
 
-function getCover(note: any) {
-  if (note.images && note.images.length) {
-    const img = note.images[0]
-    return img.local_path || img.url || img
+function getErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message) {
+    return error.message
   }
-  return null
+
+  if (typeof error === 'object' && error && 'response' in error) {
+    const detail = (error as any).response?.data?.detail
+    if (typeof detail === 'string' && detail) {
+      return detail
+    }
+  }
+
+  return fallback
+}
+
+function getCover(note: any): string {
+  if (note.images && note.images.length > 0) {
+    return getXhsImageSrc(note.images[0])
+  }
+  return ''
+}
+
+function normalizeRemoteMediaUrl(url: string): string {
+  if (url.startsWith('//')) return `https:${url}`
+  return url
+}
+
+function buildProxyMediaUrl(url: string): string {
+  return `/api/proxy/image?url=${encodeURIComponent(normalizeRemoteMediaUrl(url))}`
 }
 
 function getAvatarSrc(url: string): string {
   if (!url) return ''
+  url = normalizeRemoteMediaUrl(url)
   if (url.startsWith('/static/')) return url
-  if (url.startsWith('http')) return `/api/proxy/image?url=${encodeURIComponent(url)}`
+  if (url.startsWith('http')) return buildProxyMediaUrl(url)
   return url
 }
 
 function getXhsImageSrc(img: any): string {
   if (typeof img === 'string') {
+    img = normalizeRemoteMediaUrl(img)
     if (img.startsWith('/static/') || img.startsWith('/api/')) return img
-    if (img.startsWith('http')) return `/api/proxy/image?url=${encodeURIComponent(img)}`
+    if (img.startsWith('http')) return buildProxyMediaUrl(img)
     return img
   }
   if (img.local_path) return img.local_path
-  if (img.url) return `/api/proxy/image?url=${encodeURIComponent(img.url)}`
+  if (img.url) return buildProxyMediaUrl(img.url)
+  return ''
+}
+
+function getXhsVideoSrc(note: any): string {
+  if (!note) return ''
+  if (note.local_video_path) return note.local_video_path
+  if (note.video_url) return buildProxyMediaUrl(note.video_url)
   return ''
 }
 
@@ -287,6 +382,15 @@ function formatDuration(seconds: number) {
 }
 
 onMounted(() => { loadAccounts(); loadNotes() })
+
+onUnmounted(() => {
+  if (crawlStatusTimer) {
+    clearInterval(crawlStatusTimer)
+  }
+  if (commentsRefreshTimer) {
+    clearTimeout(commentsRefreshTimer)
+  }
+})
 </script>
 
 <style scoped>

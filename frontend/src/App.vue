@@ -129,17 +129,35 @@
       <div class="content-shell">
         <header class="workspace-header">
           <div class="workspace-copy">
-            <p class="workspace-kicker">{{ currentModule.badge }}</p>
-            <h2>{{ currentModule.title }}</h2>
-            <p>{{ currentModule.description }}</p>
+            <div class="workspace-copy-main">
+              <p class="workspace-kicker">{{ currentModule.badge }}</p>
+              <h2>{{ currentModule.title }}</h2>
+              <p>{{ currentModule.description }}</p>
+            </div>
+
+            <div class="workspace-copy-side">
+              <div class="workspace-status-panel">
+                <span class="workspace-status-label">系统信号</span>
+                <div class="workspace-status-grid">
+                  <div class="workspace-status-pill" :class="napcatConnected ? 'online' : 'offline'">
+                    <span class="workspace-status-dot" :class="napcatConnected ? 'online' : 'offline'"></span>
+                    <span>NapCat {{ napcatConnected ? '在线' : '待接入' }}</span>
+                  </div>
+                  <div class="workspace-status-pill" :class="wsStatus === 'connected' ? 'online' : wsStatus === 'connecting' ? 'pending' : 'offline'">
+                    <span class="workspace-status-dot" :class="wsStatus === 'connected' ? 'online' : wsStatus === 'connecting' ? 'pending' : 'offline'"></span>
+                    <span>WS {{ wsStatusText }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="highlight-ribbon">
+                <span v-for="highlight in currentModule.highlights" :key="highlight" class="highlight-pill">
+                  {{ highlight }}
+                </span>
+              </div>
+            </div>
           </div>
         </header>
-
-        <div class="highlight-ribbon">
-          <span v-for="highlight in currentModule.highlights" :key="highlight" class="highlight-pill">
-            {{ highlight }}
-          </span>
-        </div>
 
         <div class="view-stage">
           <router-view />
@@ -147,6 +165,33 @@
       </div>
     </a-layout-content>
   </a-layout>
+
+  <a-modal
+    :visible="adminTokenModalVisible"
+    :mask-closable="false"
+    :closable="false"
+    :footer="false"
+    width="420px"
+  >
+    <template #title>管理员认证</template>
+    <div class="auth-modal-body">
+      <p>管理接口已启用管理员令牌保护。请输入当前令牌后继续访问系统状态和实时 WebSocket。</p>
+      <p class="auth-modal-note">未单独配置管理员令牌时，系统会回退使用服务端 SECRET_KEY。</p>
+      <a-input-password
+        v-model="adminTokenInput"
+        allow-clear
+        placeholder="请输入 ADMIN_API_TOKEN"
+        @press-enter="submitAdminToken"
+      />
+      <div v-if="adminTokenHint" class="napcat-error-box">
+        {{ adminTokenHint }}
+      </div>
+      <div class="auth-modal-actions">
+        <a-button type="secondary" @click="clearAdminTokenAndRetry">清空令牌</a-button>
+        <a-button type="primary" @click="submitAdminToken">保存并重连</a-button>
+      </div>
+    </div>
+  </a-modal>
 </template>
 
 <script setup lang="ts">
@@ -165,6 +210,7 @@ import {
   IconSunFill,
 } from '@arco-design/web-vue/es/icon'
 import axios from 'axios'
+import { buildAdminAuthHeaders, clearStoredAdminToken, getStoredAdminToken, openAdminWebSocket, setStoredAdminToken } from '@/utils/adminToken'
 
 type ThemeMode = 'light' | 'dark' | 'auto'
 
@@ -213,7 +259,7 @@ const router = useRouter()
 const route = useRoute()
 
 const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
-const compactQuery = window.matchMedia('(max-width: 1180px)')
+const compactQuery = window.matchMedia('(max-width: 1080px)')
 
 const currentTheme = ref<ThemeMode>((localStorage.getItem('theme') as ThemeMode) || 'auto')
 const isCompactViewport = ref(compactQuery.matches)
@@ -223,6 +269,9 @@ const napcatQQ = ref('')
 const napcatError = ref('')
 const lastCheckTime = ref('')
 const wsStatus = ref<'connected' | 'connecting' | 'disconnected'>('disconnected')
+const adminTokenModalVisible = ref(false)
+const adminTokenInput = ref(getStoredAdminToken())
+const adminTokenHint = ref('')
 
 let ws: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
@@ -259,7 +308,7 @@ function applyTheme(mode: ThemeMode) {
   } else {
     document.body.removeAttribute('arco-theme')
   }
-  window.setTimeout(() => document.documentElement.classList.remove('theme-transition'), 320)
+  window.setTimeout(() => document.documentElement.classList.remove('theme-transition'), 240)
 }
 
 function toggleTheme() {
@@ -290,11 +339,52 @@ function onMenuClick(key: string) {
   router.push(`/${key}`)
 }
 
+function openAdminTokenModal(message: string, resetStoredToken: boolean = false) {
+  if (resetStoredToken) {
+    clearStoredAdminToken()
+  }
+  adminTokenInput.value = getStoredAdminToken()
+  adminTokenHint.value = message
+  adminTokenModalVisible.value = true
+}
+
+function clearAdminTokenAndRetry() {
+  clearStoredAdminToken()
+  adminTokenInput.value = ''
+  adminTokenHint.value = '请输入新的管理员令牌。'
+}
+
+function submitAdminToken() {
+  const token = adminTokenInput.value.trim()
+  if (!token) {
+    adminTokenHint.value = '管理员令牌不能为空。'
+    return
+  }
+
+  setStoredAdminToken(token)
+  adminTokenModalVisible.value = false
+  adminTokenHint.value = ''
+  napcatError.value = ''
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
+  }
+  void fetchNapcatStatus()
+  connectWS()
+}
+
 async function fetchNapcatStatus() {
+  if (adminTokenModalVisible.value && !getStoredAdminToken()) {
+    return
+  }
+
   try {
-    const { data } = await axios.get('/api/system/napcat-status')
+    const { data } = await axios.get('/api/system/napcat-status', {
+      headers: buildAdminAuthHeaders(),
+    })
     lastCheckTime.value = new Date().toLocaleTimeString('zh-CN')
     napcatError.value = ''
+    adminTokenModalVisible.value = false
     if (data.connected_count > 0) {
       napcatConnected.value = true
       napcatQQ.value = data.connections?.[0]?.qq || ''
@@ -304,18 +394,38 @@ async function fetchNapcatStatus() {
     }
   } catch (error: any) {
     lastCheckTime.value = new Date().toLocaleTimeString('zh-CN')
-    napcatError.value = `后端请求失败: ${error.message || '未知错误'}`
+    const status = error.response?.status
+    const detail = error.response?.data?.detail || ''
+    if (status === 401) {
+      openAdminTokenModal(detail || '管理员令牌缺失或无效。', true)
+      napcatError.value = '管理员认证失败，请重新输入令牌。'
+    } else if (status === 503) {
+      adminTokenModalVisible.value = false
+      napcatError.value = detail || '服务器尚未配置管理员令牌；请在服务端设置 ADMIN_API_TOKEN，或使用非默认 SECRET_KEY 作为回退令牌。'
+    } else {
+      napcatError.value = `后端请求失败: ${detail || error.message || '未知错误'}`
+    }
     napcatConnected.value = false
   }
 }
 
 function connectWS() {
+  const storedToken = getStoredAdminToken()
+  if (!storedToken) {
+    wsStatus.value = 'disconnected'
+    return
+  }
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.close()
+  }
   wsStatus.value = 'connecting'
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  ws = new WebSocket(`${protocol}//${location.host}/ws/client`)
+  ws = openAdminWebSocket(`${protocol}//${location.host}/ws/client`)
 
   ws.onopen = () => {
     wsStatus.value = 'connected'
+    adminTokenModalVisible.value = false
     if (pingTimer) clearInterval(pingTimer)
     pingTimer = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -343,13 +453,24 @@ function connectWS() {
     }
   }
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
     wsStatus.value = 'disconnected'
     if (pingTimer) {
       clearInterval(pingTimer)
       pingTimer = null
     }
     if (reconnectTimer) clearTimeout(reconnectTimer)
+    if (event.code === 1008) {
+      const reason = event.reason || '管理员认证失败。'
+      if (reason.includes('未配置')) {
+        napcatError.value = reason
+        adminTokenModalVisible.value = false
+      } else {
+        openAdminTokenModal(reason, true)
+        napcatError.value = reason
+      }
+      return
+    }
     reconnectTimer = setTimeout(connectWS, 5000)
   }
 

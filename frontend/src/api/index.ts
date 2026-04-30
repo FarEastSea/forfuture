@@ -1,6 +1,21 @@
-import axios from 'axios'
+import axios, { AxiosHeaders } from 'axios'
+
+import { buildAdminAuthHeaders, getStoredAdminToken } from '@/utils/adminToken'
 
 const api = axios.create({ baseURL: '/api', timeout: 30000 })
+
+api.interceptors.request.use((config) => {
+  const token = getStoredAdminToken()
+  if (!token) {
+    return config
+  }
+
+  const headers = AxiosHeaders.from(config.headers)
+  headers.set('Authorization', `Bearer ${token}`)
+  config.headers = headers
+
+  return config
+})
 
 // QQ
 export const qqApi = {
@@ -51,7 +66,7 @@ export const chatApi = {
   sendMessage: (sessionId: number, content: string) => {
     return fetch(`/api/chat/sessions/${sessionId}/messages`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: buildAdminAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ content }),
     })
   },
@@ -83,7 +98,7 @@ export const systemApi = {
   getConfigs: () => api.get('/system/configs'),
   updateConfigs: (items: any[]) => api.put('/system/configs', items),
   getDbConfig: () => api.get('/system/db-config'),
-  testDbConnection: (params: any) => api.post('/system/db-config/test', null, { params }),
+  testDbConnection: (data: any) => api.post('/system/db-config/test', data),
   getNapcatStatus: () => api.get('/system/napcat-status'),
   getNapcatLogs: () => api.get('/system/napcat-logs'),
   getLogs: (params?: { level?: string; module?: string; keyword?: string; limit?: number }) =>

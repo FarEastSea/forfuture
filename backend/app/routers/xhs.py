@@ -2,11 +2,47 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, func
 from typing import Optional
+import os
 from app.database import get_db
+from app.config import settings
 from app.models.xhs_post import XHSNote, XHSComment
 from app.schemas import XHSCrawlRequest
+from app.security import require_admin_http
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_admin_http)])
+
+
+def _sanitize_avatar(avatar: str | None) -> str:
+    if not avatar or not avatar.startswith("/static/"):
+        return avatar or ""
+
+    file_path = os.path.join(settings.static_dir, avatar[len("/static/"):])
+    return avatar if os.path.isfile(file_path) else ""
+
+
+def _sanitize_images(images: list | None) -> list:
+    if not images:
+        return []
+
+    sanitized_images = []
+    for image in images:
+        if isinstance(image, dict):
+            local_path = image.get("local_path")
+            if local_path and local_path.startswith("/static/"):
+                file_path = os.path.join(settings.static_dir, local_path[len("/static/"):])
+                if not os.path.isfile(file_path):
+                    image = {**image, "local_path": None}
+        sanitized_images.append(image)
+
+    return sanitized_images
+
+
+def _sanitize_local_video_path(local_video_path: str | None) -> str | None:
+    if not local_video_path or not local_video_path.startswith("/static/"):
+        return local_video_path
+
+    file_path = os.path.join(settings.static_dir, local_video_path[len("/static/"):])
+    return local_video_path if os.path.isfile(file_path) else None
 
 
 @router.get("/notes")
@@ -25,6 +61,10 @@ async def get_xhs_notes(
 
     note_list = []
     for note in notes:
+        sanitized_images = _sanitize_images(note.images)
+        sanitized_avatar = _sanitize_avatar(note.author_avatar)
+        sanitized_local_video_path = _sanitize_local_video_path(note.local_video_path)
+
         comments_q = select(XHSComment).where(
             XHSComment.note_id == note.id, XHSComment.reply_to_id == None
         ).order_by(XHSComment.comment_time)
@@ -63,11 +103,12 @@ async def get_xhs_notes(
             "note_id": note.note_id,
             "note_type": note.note_type,
             "author_nickname": note.author_nickname,
-            "author_avatar": note.author_avatar,
+            "author_avatar": sanitized_avatar,
             "title": note.title,
             "content": note.content,
-            "images": note.images or [],
+            "images": sanitized_images,
             "video_url": note.video_url,
+            "local_video_path": sanitized_local_video_path,
             "video_duration": note.video_duration,
             "tags": note.tags or [],
             "at_user_list": note.at_user_list or [],
@@ -101,6 +142,10 @@ async def get_xhs_note_detail(note_db_id: int, db: AsyncSession = Depends(get_db
     note = result.scalar_one_or_none()
     if not note:
         raise HTTPException(status_code=404, detail="笔记不存在")
+
+    sanitized_images = _sanitize_images(note.images)
+    sanitized_avatar = _sanitize_avatar(note.author_avatar)
+    sanitized_local_video_path = _sanitize_local_video_path(note.local_video_path)
 
     comments_q = select(XHSComment).where(
         XHSComment.note_id == note.id, XHSComment.reply_to_id == None
@@ -140,12 +185,12 @@ async def get_xhs_note_detail(note_db_id: int, db: AsyncSession = Depends(get_db
         "note_id": note.note_id,
         "note_type": note.note_type,
         "author_nickname": note.author_nickname,
-        "author_avatar": note.author_avatar,
+        "author_avatar": sanitized_avatar,
         "title": note.title,
         "content": note.content,
-        "images": note.images or [],
+        "images": sanitized_images,
         "video_url": note.video_url,
-        "local_video_path": note.local_video_path,
+        "local_video_path": sanitized_local_video_path,
         "video_duration": note.video_duration,
         "tags": note.tags or [],
         "at_user_list": note.at_user_list or [],

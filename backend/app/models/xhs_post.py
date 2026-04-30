@@ -15,12 +15,12 @@ class XHSNote(Base):
     author_avatar = Column(String(500))
     title = Column(String(500))
     content = Column(Text)
-    images = Column(JSON, default=[])
+    images = Column(JSON, default=list)
     video_url = Column(String(500))
     local_video_path = Column(String(500))
     video_duration = Column(Integer)  # 视频时长（秒）
-    tags = Column(JSON, default=[])
-    at_user_list = Column(JSON, default=[])  # @用户列表
+    tags = Column(JSON, default=list)
+    at_user_list = Column(JSON, default=list)  # @用户列表
     like_count = Column(Integer, default=0)
     collect_count = Column(Integer, default=0)
     comment_count = Column(Integer, default=0)
@@ -31,7 +31,7 @@ class XHSNote(Base):
     ip_location = Column(String(100))  # IP属地（如"江苏"）
     location = Column(String(200))  # 位置信息
     device_info = Column(String(200))  # 发布设备
-    edit_history = Column(JSON, default=[])  # 编辑历史记录
+    edit_history = Column(JSON, default=list)  # 编辑历史记录
     raw_data = Column(JSON)
     crawled_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

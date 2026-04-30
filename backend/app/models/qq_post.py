@@ -13,7 +13,7 @@ class QQPost(Base):
     author_nickname = Column(String(100))
     author_avatar = Column(String(500))
     content = Column(Text)
-    images = Column(JSON, default=[])
+    images = Column(JSON, default=list)
     video_url = Column(String(500))
     local_video_path = Column(String(500))
     post_time = Column(DateTime, index=True)
@@ -22,7 +22,7 @@ class QQPost(Base):
     forward_content = Column(Text)
     device_info = Column(String(200))  # 发布设备，如 "荣耀90 GT (5G)"
     location = Column(String(200))  # 位置信息
-    edit_history = Column(JSON, default=[])  # 编辑历史记录
+    edit_history = Column(JSON, default=list)  # 编辑历史记录
     raw_data = Column(JSON)
     crawled_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

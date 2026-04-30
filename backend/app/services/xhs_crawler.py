@@ -228,6 +228,7 @@ class XHSCrawler:
             # 保存到数据库
             from app.database import async_session
             from app.models.account import Account
+            from app.services.account_risk_service import mark_account_verified
             from sqlalchemy import select
 
             async with async_session() as db:
@@ -244,7 +245,6 @@ class XHSCrawler:
 
                 if existing_account:
                     existing_account.cookies = json.dumps(cookies)
-                    existing_account.status = "active"
                     existing_account.last_login = datetime.now()
                     if login_red_id:
                         existing_account.account_id = login_red_id
@@ -252,6 +252,7 @@ class XHSCrawler:
                         existing_account.nickname = nickname
                     if login_avatar_local:
                         existing_account.avatar_url = login_avatar_local
+                    mark_account_verified(existing_account)
                     account = existing_account
                     logger.info(f"手动保存Cookie: 更新已有账号 uid={xhs_user_id}")
                 else:
@@ -262,10 +263,10 @@ class XHSCrawler:
                         nickname=nickname,
                         avatar_url=login_avatar_local or "",
                         cookies=json.dumps(cookies),
-                        status="active",
                         is_target=0,
                         last_login=datetime.now(),
                     )
+                    mark_account_verified(account)
                     db.add(account)
                     logger.info(f"手动保存Cookie: 新增账号 uid={xhs_user_id}")
                 await db.commit()
@@ -285,36 +286,111 @@ class XHSCrawler:
             logger.error(f"手动保存Cookie失败: {e}", exc_info=True)
             return {"ok": False, "error": str(e)}
 
-    async def start_crawl(self, user_ids: list[str], mode: str = "incremental") -> str:
+    async def _load_login_account(
+        self,
+        login_account_id: int | None = None,
+        *,
+        require_cookies: bool = False,
+        allow_degraded: bool = False,
+    ):
+        from app.database import async_session
+        from app.models.account import Account
+        from app.services.account_risk_service import get_preferred_login_account, is_login_account_eligible
+        from sqlalchemy import select
+
+        async with async_session() as db:
+            if login_account_id is not None:
+                result = await db.execute(
+                    select(Account).where(
+                        Account.id == login_account_id,
+                        Account.platform == "xhs",
+                        Account.is_target == 0,
+                    )
+                )
+                account = result.scalars().first()
+                if account and is_login_account_eligible(
+                    account,
+                    require_cookies=require_cookies,
+                    allow_degraded=allow_degraded,
+                ):
+                    return account
+                return None
+
+            return await get_preferred_login_account(
+                db,
+                "xhs",
+                require_cookies=require_cookies,
+                allow_degraded=allow_degraded,
+            )
+
+    async def _mark_login_account_expired(self, login_account_id: int | None, *, reason: str):
+        if login_account_id is None:
+            return
+
+        from app.database import async_session
+        from app.models.account import Account
+        from app.services.account_risk_service import mark_account_expired
+
+        async with async_session() as db:
+            account = await db.get(Account, login_account_id)
+            if not account:
+                return
+
+            mark_account_expired(account, reason=reason)
+            await db.commit()
+
+    async def start_crawl(
+        self,
+        user_ids: list[str],
+        mode: str = "incremental",
+        login_account_id: int | None = None,
+        allow_degraded_login: bool = False,
+    ) -> str:
         task_id = uuid.uuid4().hex[:8]
         self._status = {"running": True, "task_id": task_id, "progress": "启动中...", "error": None}
         self._crawl_mode = mode  # "incremental" or "overwrite"
-        asyncio.create_task(self._crawl_task(user_ids, task_id))
+        asyncio.create_task(
+            self._crawl_task(
+                user_ids,
+                task_id,
+                login_account_id=login_account_id,
+                allow_degraded_login=allow_degraded_login,
+            )
+        )
         return task_id
 
-    async def _crawl_task(self, user_ids: list[str], task_id: str):
+    async def _crawl_task(
+        self,
+        user_ids: list[str],
+        task_id: str,
+        *,
+        login_account_id: int | None = None,
+        allow_degraded_login: bool = False,
+    ):
         try:
-            # 先检查是否有XHS登录账号
-            from app.database import async_session
-            from app.models.account import Account
-            from sqlalchemy import select as _sel
-            async with async_session() as _db:
-                _r = await _db.execute(
-                    _sel(Account).where(
-                        Account.platform == "xhs", Account.status == "active", Account.is_target == 0
-                    )
-                )
-                _login_acc = _r.scalars().first()
-                if not _login_acc or not _login_acc.cookies:
-                    self._status["error"] = "请先在设置页面扫码登录小红书账号，否则无法爬取"
-                    self._status["running"] = False
-                    logger.warning("XHS无已登录账号，请先扫码登录小红书")
-                    return
+            login_account = await self._load_login_account(
+                login_account_id,
+                require_cookies=True,
+                allow_degraded=allow_degraded_login,
+            )
+            if not login_account or not login_account.cookies:
+                self._status["error"] = "请先在设置页面扫码登录小红书账号，否则无法爬取"
+                self._status["running"] = False
+                logger.warning("XHS无已登录账号，请先扫码登录小红书")
+                return
 
-            success = await self._crawl_via_api(user_ids)
+            success = await self._crawl_via_api(
+                user_ids,
+                login_account_id=login_account.id,
+                allow_degraded_login=allow_degraded_login,
+            )
             if not success:
                 logger.info("API抓取失败，降级到Playwright")
-                await self._crawl_via_playwright(user_ids)
+                await self._crawl_via_playwright(
+                    user_ids,
+                    login_account_id=login_account.id,
+                    allow_degraded_login=allow_degraded_login,
+                )
             self._status["progress"] = "完成"
         except Exception as e:
             logger.error(f"小红书抓取任务失败: {e}")
@@ -322,26 +398,26 @@ class XHSCrawler:
         finally:
             self._status["running"] = False
 
-    async def _crawl_via_api(self, user_ids: list[str]) -> bool:
+    async def _crawl_via_api(
+        self,
+        user_ids: list[str],
+        *,
+        login_account_id: int | None = None,
+        allow_degraded_login: bool = False,
+    ) -> bool:
         """通过Playwright浏览器response拦截抓取小红书笔记（利用XHS自身JS签名，彻底解决406）
 
         核心原理：导航到用户主页，XHS自身JS自动发出签名请求，我们拦截API响应获取数据。
         """
-        from app.database import async_session
-        from app.models.account import Account
-        from sqlalchemy import select
-
-        async with async_session() as db:
-            result = await db.execute(
-                select(Account)
-                .where(Account.platform == "xhs", Account.status == "active", Account.is_target == 0)
-                .order_by(Account.last_login.desc(), Account.id.desc())
-            )
-            account = result.scalars().first()
-            if not account or not account.cookies:
-                logger.warning("XHS无已登录账号Cookie，API模式不可用")
-                return False
-            cookies_str = account.cookies
+        account = await self._load_login_account(
+            login_account_id,
+            require_cookies=True,
+            allow_degraded=allow_degraded_login,
+        )
+        if not account or not account.cookies:
+            logger.warning("XHS无已登录账号Cookie，API模式不可用")
+            return False
+        cookies_str = account.cookies
 
         try:
             cookies = json.loads(cookies_str)
@@ -428,7 +504,11 @@ class XHSCrawler:
                         continue
 
                     # 2. 通过多策略获取笔记（__INITIAL_STATE__ → DOM提取 → API拦截）
-                    notes = await self._intercept_profile_notes(page, api_uid)
+                    notes = await self._intercept_profile_notes(
+                        page,
+                        api_uid,
+                        login_account_id=account.id,
+                    )
                     if notes:
                         source = "state_or_dom" if len(notes) > 0 else "api_intercept"
                         await self._save_notes(uid, notes, source)
@@ -553,7 +633,13 @@ class XHSCrawler:
                     # 3. 逐条笔记: 获取原图+视频+评论（从主页上下文调用API）
                     if notes:
                         self._status["progress"] = f"{uid} 正在获取笔记原图/视频/评论..."
-                        await self._enrich_notes_detail(page, uid, notes, api_uid=api_uid)
+                        await self._enrich_notes_detail(
+                            page,
+                            uid,
+                            notes,
+                            api_uid=api_uid,
+                            login_account_id=account.id,
+                        )
 
                     await asyncio.sleep(2)
                 except Exception as e:
@@ -733,14 +819,21 @@ class XHSCrawler:
                 await db.commit()
                 logger.info(f"XHS 已缓存 {account_id} → {platform_uid}")
 
-    async def _intercept_profile_notes(self, page, object_id: str) -> list[dict]:
+    async def _intercept_profile_notes(
+        self,
+        page,
+        object_id: str,
+        *,
+        login_account_id: int | None = None,
+    ) -> list[dict]:
         """导航到用户主页，拦截XHS自身发出的API响应获取全部笔记"""
         captured_notes = []
         seen_note_ids = set()
         has_more = True
+        cookie_invalid_detected = False
 
         async def on_profile_response(response):
-            nonlocal has_more
+            nonlocal has_more, cookie_invalid_detected
             url = response.url
             # 精确匹配用户笔记API（user_posted等）
             is_user_posted = any(kw in url for kw in (
@@ -787,8 +880,13 @@ class XHSCrawler:
                 except Exception:
                     pass
             # 检测Cookie过期
-            if response.status in (401, 461) and 'xiaohongshu.com' in url:
+            if response.status in (401, 461) and 'xiaohongshu.com' in url and not cookie_invalid_detected:
+                cookie_invalid_detected = True
                 logger.warning(f"XHS API返回 {response.status}，Cookie可能已过期")
+                await self._mark_login_account_expired(
+                    login_account_id,
+                    reason=f"xhs_cookie_http_{response.status}",
+                )
                 await self._notify_cookie_expired("小红书", f"API返回HTTP {response.status}")
 
         page.on('response', on_profile_response)
@@ -815,6 +913,10 @@ class XHSCrawler:
                     logger.warning(f"XHS Cookie已过期，页面被重定向到登录页: {page_url}")
                     self.login_status = "expired"
                     self.login_status_detail = "Cookie已过期，抓取时被重定向到登录页"
+                    await self._mark_login_account_expired(
+                        login_account_id,
+                        reason="xhs_cookie_redirected_to_login",
+                    )
                     asyncio.create_task(self._notify_cookie_expired("小红书", "抓取时页面被重定向到登录页"))
                     return []
                 # 记录页面笔记数量用于诊断
@@ -1122,7 +1224,13 @@ class XHSCrawler:
 
         return dom_notes or []
 
-    async def _crawl_via_playwright(self, user_ids: list[str]):
+    async def _crawl_via_playwright(
+        self,
+        user_ids: list[str],
+        *,
+        login_account_id: int | None = None,
+        allow_degraded_login: bool = False,
+    ):
         """通过Playwright浏览器自动化抓取小红书"""
         try:
             from playwright.async_api import async_playwright
@@ -1130,26 +1238,20 @@ class XHSCrawler:
             self._status["error"] = "Playwright未安装"
             return
 
-        from app.database import async_session
-        from app.models.account import Account
-        from sqlalchemy import select
-
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
                 args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
             )
 
-            async with async_session() as db:
-                result = await db.execute(
-                    select(Account)
-                    .where(Account.platform == "xhs", Account.status == "active", Account.is_target == 0)
-                    .order_by(Account.last_login.desc(), Account.id.desc())
-                )
-                account = result.scalars().first()
-                cookies = None
-                if account and account.cookies:
-                    cookies = json.loads(account.cookies)
+            account = await self._load_login_account(
+                login_account_id,
+                require_cookies=False,
+                allow_degraded=allow_degraded_login,
+            )
+            cookies = None
+            if account and account.cookies:
+                cookies = json.loads(account.cookies)
 
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
@@ -1559,11 +1661,17 @@ class XHSCrawler:
             db.add(xhs_note)
             await db.commit()
 
-    async def _enrich_notes_detail(self, page, uid: str, notes: list[dict], api_uid: str = None):
+    async def _enrich_notes_detail(
+        self,
+        page,
+        uid: str,
+        notes: list[dict],
+        api_uid: str = None,
+        login_account_id: int | None = None,
+    ):
         """通过XHR API调用获取笔记原图/视频/评论，更新数据库"""
         from app.database import async_session
         from app.models.xhs_post import XHSNote
-        from app.models.account import Account
         from app.services.media_service import media_service
         from sqlalchemy import select
         from sqlalchemy.orm.attributes import flag_modified
@@ -1615,21 +1723,11 @@ class XHSCrawler:
                              f"小红书登录Cookie已失效, 请重新扫码登录! "
                              f"剩余 {len(note_ids)-idx} 条笔记跳过")
                 self._status["error"] = "小红书Cookie已过期，请重新扫码登录"
-                # 标记账号Cookie为过期状态
-                try:
-                    async with async_session() as db:
-                        result = await db.execute(
-                            select(Account).where(
-                                Account.platform == "xhs", Account.is_target == 0,
-                                Account.status == "active"
-                            )
-                        )
-                        for acc in result.scalars().all():
-                            acc.status = "expired"
-                        await db.commit()
-                        logger.warning("XHS 已将所有登录账号标记为过期")
-                except Exception as e:
-                    logger.debug(f"XHS 标记账号过期失败: {e}")
+                await self._mark_login_account_expired(
+                    login_account_id,
+                    reason="xhs_cookie_detail_auth_failed",
+                )
+                await self._notify_cookie_expired("小红书", "笔记详情接口连续返回登录失效")
                 break
             try:
                 logger.info(f"XHS {uid} 处理详情 {idx+1}/{len(note_ids)}: {note_id}")
@@ -2288,24 +2386,22 @@ class XHSCrawler:
         finally:
             page.remove_listener('response', on_response)
 
-    async def crawl_single_note_comments(self, note_id: str) -> int:
+    async def crawl_single_note_comments(
+        self,
+        note_id: str,
+        login_account_id: int | None = None,
+        *,
+        allow_degraded_login: bool = False,
+    ) -> int:
         """为单条笔记抓取评论（由API endpoint调用），返回新增评论数"""
-        from app.database import async_session
-        from app.models.xhs_post import XHSNote
-        from app.models.account import Account
-        from sqlalchemy import select
-
-        # 获取登录Cookie
-        async with async_session() as db:
-            result = await db.execute(
-                select(Account)
-                .where(Account.platform == "xhs", Account.status == "active", Account.is_target == 0)
-                .order_by(Account.last_login.desc())
-            )
-            account = result.scalars().first()
-            if not account or not account.cookies:
-                raise Exception("无可用的小红书登录Cookie")
-            cookies = json.loads(account.cookies)
+        account = await self._load_login_account(
+            login_account_id,
+            require_cookies=True,
+            allow_degraded=allow_degraded_login,
+        )
+        if not account or not account.cookies:
+            raise Exception("无可用的小红书登录Cookie")
+        cookies = json.loads(account.cookies)
 
         try:
             from playwright.async_api import async_playwright
@@ -3490,11 +3586,12 @@ class XHSCrawler:
                         )
                         existing_account = result.scalars().first()
 
+                    from app.services.account_risk_service import mark_account_verified
+
                     if existing_account:
                         # 同一用户重新登录 → 更新
                         account = existing_account
                         account.cookies = json.dumps(cookies)
-                        account.status = "active"
                         account.last_login = datetime.now()
                         if login_red_id:
                             account.account_id = login_red_id
@@ -3506,6 +3603,7 @@ class XHSCrawler:
                                 history.append({"url": account.avatar_url, "time": datetime.now().isoformat()})
                                 account.avatar_history = history
                             account.avatar_url = login_avatar_local
+                        mark_account_verified(account)
                         logger.info(f"XHS登录: 更新已有账号 id={account.id}, uid={xhs_user_id}")
                     else:
                         # 没有匹配的平台UID → 新增账号（不覆盖其他账号）
@@ -3516,10 +3614,10 @@ class XHSCrawler:
                             nickname=nickname,
                             avatar_url=login_avatar_local or "",
                             cookies=json.dumps(cookies),
-                            status="active",
                             is_target=0,
                             last_login=datetime.now(),
                         )
+                        mark_account_verified(account)
                         db.add(account)
                         logger.info(f"XHS登录: 新增账号 uid={xhs_user_id}, nickname={nickname}")
                     await db.commit()
@@ -3573,7 +3671,7 @@ class XHSCrawler:
         """Cookie过期时通过NapCat通知管理员。
         跳过条件：
         - 通知功能未开启
-        - 该平台的登录账号已禁用（status != 'active'）
+        - 该平台的登录账号全部被手动禁用
         - 1小时内已发送过同平台通知（防止误报轰炸）
         """
         try:
@@ -3607,10 +3705,9 @@ class XHSCrawler:
                 )
                 login_accounts = login_result.scalars().all()
                 if login_accounts:
-                    # 如果所有登录账号都非active（disabled/expired），跳过通知
-                    has_active = any(a.status == "active" for a in login_accounts)
-                    if not has_active:
-                        logger.debug(f"{platform}所有登录账号均非active，跳过过期通知")
+                    has_non_disabled = any(a.status != "disabled" for a in login_accounts)
+                    if not has_non_disabled:
+                        logger.debug(f"{platform}所有登录账号均已禁用，跳过过期通知")
                         return
 
                 result = await db.execute(

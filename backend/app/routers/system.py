@@ -2,47 +2,205 @@ from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.database import get_db
+from app.config import settings, ENV_FILE
 from app.models.system_config import SystemConfig
 from app.schemas import SystemConfigItem
+from app.security import require_admin_http
 from typing import List, Optional
+from pydantic import BaseModel
 import logging
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_admin_http)])
+
+ENV_SYNC_KEYS = {
+    "database_host",
+    "database_port",
+    "database_name",
+    "database_user",
+    "database_password",
+    "napcat_ws_url",
+    "napcat_token",
+}
+
+SENSITIVE_ENV_KEYS = {"database_password", "napcat_token"}
+
+ENV_FILE_KEYS = {
+    "database_host": "DATABASE_HOST",
+    "database_port": "DATABASE_PORT",
+    "database_name": "DATABASE_NAME",
+    "database_user": "DATABASE_USER",
+    "database_password": "DATABASE_PASSWORD",
+    "napcat_ws_url": "NAPCAT_WS_URL",
+    "napcat_token": "NAPCAT_TOKEN",
+}
+
+ENV_KEY_ALIASES = {
+    **{key.lower(): key for key in ENV_SYNC_KEYS},
+    **{env_key.lower(): key for key, env_key in ENV_FILE_KEYS.items()},
+}
+
+
+class DatabaseConnectionTestRequest(BaseModel):
+    host: str
+    port: int
+    name: str
+    user: str
+    password: str
+
+
+def _format_env_value(value: str) -> str:
+    if value == "":
+        return '""'
+    if any(ch.isspace() for ch in value) or any(ch in value for ch in '#"\\'):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return value
+
+
+def _load_env_settings() -> dict[str, str]:
+    if not ENV_FILE.exists():
+        return {}
+
+    values: dict[str, str] = {}
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            continue
+
+        raw_key, _, raw_value = line.partition("=")
+        key = ENV_KEY_ALIASES.get(raw_key.strip().lower(), raw_key.strip())
+        value = raw_value.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            value = value[1:-1].replace('\\"', '"').replace('\\\\', '\\')
+        values[key] = value
+
+    return values
+
+
+def _sync_env_settings(updates: dict[str, str]) -> None:
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    existing_lines = ENV_FILE.read_text(encoding="utf-8").splitlines(keepends=True) if ENV_FILE.exists() else []
+    rewritten_lines: list[str] = []
+    seen_keys: set[str] = set()
+
+    for line in existing_lines:
+        if "=" not in line or line.lstrip().startswith("#"):
+            rewritten_lines.append(line)
+            continue
+
+        raw_key, _, _ = line.partition("=")
+        normalized_key = ENV_KEY_ALIASES.get(raw_key.strip().lower(), raw_key.strip())
+        if normalized_key in updates:
+            env_file_key = ENV_FILE_KEYS.get(normalized_key, normalized_key)
+            rewritten_lines.append(f"{env_file_key}={_format_env_value(updates[normalized_key])}\n")
+            seen_keys.add(normalized_key)
+        else:
+            rewritten_lines.append(line if line.endswith("\n") else f"{line}\n")
+
+    for key, value in updates.items():
+        if key not in seen_keys:
+            env_file_key = ENV_FILE_KEYS.get(key, key)
+            rewritten_lines.append(f"{env_file_key}={_format_env_value(value)}\n")
+
+    temp_env_file = ENV_FILE.with_name(f"{ENV_FILE.name}.tmp")
+    temp_env_file.write_text("".join(rewritten_lines), encoding="utf-8")
+    temp_env_file.replace(ENV_FILE)
+
+
+def _restore_env_snapshot(snapshot: str | None) -> None:
+    if snapshot is None:
+        if ENV_FILE.exists():
+            ENV_FILE.unlink()
+        return
+
+    temp_env_file = ENV_FILE.with_name(f"{ENV_FILE.name}.tmp")
+    temp_env_file.write_text(snapshot, encoding="utf-8")
+    temp_env_file.replace(ENV_FILE)
 
 
 @router.get("/configs")
 async def get_system_configs(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(SystemConfig).order_by(SystemConfig.key))
     configs = result.scalars().all()
-    return [
+    serialized = [
         {
-            "id": c.id, "key": c.key, "value": c.value,
+            "id": c.id,
+            "key": c.key,
+            "value": "***" if c.key in SENSITIVE_ENV_KEYS and c.value else c.value,
             "description": c.description,
             "updated_at": c.updated_at.isoformat() if c.updated_at else None,
         }
         for c in configs
     ]
 
+    env_values = _load_env_settings()
+    config_map = {item["key"]: item for item in serialized}
+    for key in ENV_SYNC_KEYS:
+        if key in env_values:
+            serialized_value = "***" if key in SENSITIVE_ENV_KEYS and env_values[key] else env_values[key]
+            if key in config_map:
+                config_map[key]["value"] = serialized_value
+            else:
+                config_map[key] = {
+                    "id": None,
+                    "key": key,
+                    "value": serialized_value,
+                    "description": None,
+                    "updated_at": None,
+                }
+
+    return sorted(config_map.values(), key=lambda item: item["key"])
+
 
 @router.put("/configs")
 async def update_system_configs(items: List[SystemConfigItem] = Body(...), db: AsyncSession = Depends(get_db)):
+    env_updates: dict[str, str] = {}
+    env_snapshot = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.exists() else None
     try:
+        current_env_values = _load_env_settings()
         for item in items:
+            env_value = item.value or ""
+            stored_value = item.value
             result = await db.execute(select(SystemConfig).where(SystemConfig.key == item.key))
             config = result.scalar_one_or_none()
+            if item.key in SENSITIVE_ENV_KEYS:
+                current_secret = current_env_values.get(item.key)
+                if not current_secret:
+                    runtime_value = getattr(settings, item.key, "")
+                    current_secret = str(runtime_value) if runtime_value else ""
+                if not current_secret and config and config.value and config.value != "***":
+                    current_secret = config.value
+                if env_value in {"", "***"} and current_secret:
+                    env_value = current_secret
+                stored_value = "***" if env_value else ""
+
             if config:
-                config.value = item.value
+                config.value = stored_value
                 if item.description:
                     config.description = item.description
             else:
-                config = SystemConfig(key=item.key, value=item.value, description=item.description)
+                config = SystemConfig(key=item.key, value=stored_value, description=item.description)
                 db.add(config)
+            if item.key in ENV_SYNC_KEYS:
+                env_updates[item.key] = env_value
+
+        if env_updates:
+            _sync_env_settings(env_updates)
+
         await db.commit()
+
         logger.info(f"系统配置已更新: {[item.key for item in items]}")
         return {"message": "配置已更新"}
+    except HTTPException:
+        raise
     except Exception as e:
         await db.rollback()
+        if env_updates:
+            try:
+                _restore_env_snapshot(env_snapshot)
+            except Exception as restore_error:
+                logger.error(f"恢复 .env 快照失败: {restore_error}", exc_info=True)
         logger.error(f"保存系统配置失败: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"保存失败: {str(e)}")
 
@@ -53,7 +211,8 @@ async def get_system_config(key: str, db: AsyncSession = Depends(get_db)):
     config = result.scalar_one_or_none()
     if not config:
         raise HTTPException(status_code=404, detail="配置项不存在")
-    return {"key": config.key, "value": config.value, "description": config.description}
+    value = "***" if key in SENSITIVE_ENV_KEYS and config.value else config.value
+    return {"key": config.key, "value": value, "description": config.description}
 
 
 @router.get("/napcat-status")
@@ -76,24 +235,45 @@ async def get_napcat_logs():
 
 
 @router.get("/db-config")
-async def get_db_config():
-    """获取当前数据库连接配置（脱敏）"""
-    from app.config import settings
+async def get_db_config(db: AsyncSession = Depends(get_db)):
+    """获取已保存的数据库连接配置（脱敏，重启后生效）"""
+    env_values = _load_env_settings()
+    config_result = await db.execute(
+        select(SystemConfig).where(
+            SystemConfig.key.in_(
+                [
+                    "database_host",
+                    "database_port",
+                    "database_name",
+                    "database_user",
+                    "database_password",
+                ]
+            )
+        )
+    )
+    db_values = {config.key: config.value for config in config_result.scalars().all()}
+
     return {
-        "host": settings.database_host,
-        "port": settings.database_port,
-        "name": settings.database_name,
-        "user": settings.database_user,
-        "password": "***",
+        "host": env_values.get("database_host") or db_values.get("database_host") or settings.database_host,
+        "port": int(env_values.get("database_port") or db_values.get("database_port") or settings.database_port),
+        "name": env_values.get("database_name") or db_values.get("database_name") or settings.database_name,
+        "user": env_values.get("database_user") or db_values.get("database_user") or settings.database_user,
+        "password": "***" if (env_values.get("database_password") or db_values.get("database_password") or settings.database_password) else "",
     }
 
 
 @router.post("/db-config/test")
-async def test_db_connection(host: str, port: int, name: str, user: str, password: str):
+async def test_db_connection(req: DatabaseConnectionTestRequest):
     """测试数据库连接"""
     import asyncpg
     try:
-        conn = await asyncpg.connect(host=host, port=port, database=name, user=user, password=password)
+        conn = await asyncpg.connect(
+            host=req.host,
+            port=req.port,
+            database=req.name,
+            user=req.user,
+            password=req.password,
+        )
         version = await conn.fetchval("SELECT version()")
         await conn.close()
         return {"success": True, "message": f"连接成功: {version[:60]}"}
