@@ -7,8 +7,9 @@ from app.database import get_db
 from app.models.qq_post import QQPost, QQComment
 from app.schemas import QQPostOut, CrawlRequest
 from app.config import settings
+from app.security import require_admin_http
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_admin_http)])
 
 
 def _check_images(images: list) -> list:
@@ -152,7 +153,15 @@ async def get_qq_post_detail(post_id: int, db: AsyncSession = Depends(get_db)):
 @router.post("/crawl")
 async def trigger_qq_crawl(req: CrawlRequest):
     from app.services.qq_crawler import qq_crawler
-    task_id = await qq_crawler.start_crawl(req.account_ids, mode=req.mode)
+    try:
+        task_id = await qq_crawler.start_crawl(
+            req.account_ids,
+            mode=req.mode,
+            login_account_id=req.login_account_id,
+        )
+    except RuntimeError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"task_id": task_id, "message": "抓取任务已启动"}
 
 

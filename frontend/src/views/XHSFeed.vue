@@ -8,6 +8,11 @@
             {{ a.nickname || a.account_id }}
           </a-option>
         </a-select>
+        <a-select v-model="selectedLoginAccountId" placeholder="自动选择登录账号" allow-clear style="width: 190px">
+          <a-option v-for="a in loginAccounts" :key="a.id" :value="a.id">
+            {{ a.nickname || a.account_id }}
+          </a-option>
+        </a-select>
         <a-radio-group v-model="crawlMode" type="button" size="small" style="margin-right: 8px;">
           <a-radio value="incremental">增量更新</a-radio>
           <a-radio value="overwrite">覆盖更新</a-radio>
@@ -175,12 +180,14 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
 import { Message } from '@arco-design/web-vue'
-import { xhsApi } from '@/api'
+import { authApi, xhsApi } from '@/api'
 import { IconSync, IconHeart, IconStar, IconEmpty, IconImage, IconShareAlt, IconMessage } from '@arco-design/web-vue/es/icon'
 
 const notes = ref<any[]>([])
 const accounts = ref<any[]>([])
+const loginAccounts = ref<any[]>([])
 const selectedUid = ref('')
+const selectedLoginAccountId = ref<number | undefined>(undefined)
 const loading = ref(false)
 const crawling = ref(false)
 const notesError = ref('')
@@ -221,6 +228,15 @@ async function loadAccounts() {
   }
 }
 
+async function loadLoginAccounts() {
+  try {
+    const { data } = await authApi.getAccounts('xhs')
+    loginAccounts.value = (data || []).filter((a: any) => a.is_target === 0)
+  } catch (error) {
+    Message.error(getErrorMessage(error, '小红书登录账号加载失败，请检查设置页配置。'))
+  }
+}
+
 async function startCrawl() {
   const ids = accounts.value.map((a: any) => a.account_id)
   if (!ids.length) {
@@ -229,7 +245,9 @@ async function startCrawl() {
   }
   crawling.value = true
   try {
-    await xhsApi.crawl(ids, crawlMode.value)
+    await xhsApi.crawl(ids, crawlMode.value, {
+      login_account_id: selectedLoginAccountId.value || undefined,
+    })
     if (crawlStatusTimer) {
       clearInterval(crawlStatusTimer)
     }
@@ -381,7 +399,7 @@ function formatDuration(seconds: number) {
   return m > 0 ? `${m}分${s.toString().padStart(2, '0')}秒` : `${s}秒`
 }
 
-onMounted(() => { loadAccounts(); loadNotes() })
+onMounted(() => { loadAccounts(); loadLoginAccounts(); loadNotes() })
 
 onUnmounted(() => {
   if (crawlStatusTimer) {

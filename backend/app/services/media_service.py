@@ -5,6 +5,7 @@ import ssl
 import uuid
 import asyncio
 import logging
+from urllib.parse import urljoin, urlparse
 from pathlib import Path
 from app.config import settings
 
@@ -12,6 +13,11 @@ logger = logging.getLogger(__name__)
 
 
 class MediaService:
+    QQ_MEDIA_SUFFIXES = ("qq.com", "qpic.cn", "qlogo.cn", "gtimg.cn", "gtimg.com")
+    XHS_MEDIA_SUFFIXES = ("xiaohongshu.com", "xhscdn.com")
+    MAX_IMAGE_BYTES = 15 * 1024 * 1024
+    MAX_VIDEO_BYTES = 300 * 1024 * 1024
+
     def __init__(self):
         self.qq_dir = os.path.join(settings.static_dir, "qq_images")
         self.xhs_dir = os.path.join(settings.static_dir, "xhs_images")
@@ -74,21 +80,77 @@ class MediaService:
             headers["Referer"] = "https://user.qzone.qq.com/"
         return headers
 
-    async def _try_download_one(self, url: str, headers: dict, filepath: str, retries: int = 3) -> str | None:
+    def _allowed_suffixes_for_platform(self, platform: str) -> tuple[str, ...]:
+        if platform == "qq":
+            return self.QQ_MEDIA_SUFFIXES
+        if platform == "xhs":
+            return self.XHS_MEDIA_SUFFIXES
+        return self.QQ_MEDIA_SUFFIXES + self.XHS_MEDIA_SUFFIXES
+
+    def _is_allowed_media_url(self, url: str, platform: str) -> bool:
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+        if parsed.scheme not in {"http", "https"} or not hostname:
+            return False
+        return any(
+            hostname == suffix or hostname.endswith(f".{suffix}")
+            for suffix in self._allowed_suffixes_for_platform(platform)
+        )
+
+    async def _try_download_one(self, url: str, headers: dict, filepath: str, platform: str, retries: int = 3) -> str | None:
         """尝试下载单个URL到文件。成功返回实际文件路径，失败返回None。"""
+        if not self._is_allowed_media_url(url, platform):
+            logger.warning(f"图片下载被拒绝，域名不在允许列表: {url[:100]}")
+            return None
         for attempt in range(retries):
             try:
-                async with httpx.AsyncClient(
-                    timeout=30, follow_redirects=True, verify=False, headers=headers
-                ) as client:
-                    resp = await client.get(url)
-                    if resp.status_code == 200 and len(resp.content) > 100:
-                        with open(filepath, "wb") as f:
-                            f.write(resp.content)
-                        logger.debug(f"图片下载成功: {url[:80]} → {os.path.basename(filepath)} ({len(resp.content):,} bytes)")
-                        return filepath
-                    else:
-                        logger.debug(f"图片下载响应异常: {url[:80]}, status={resp.status_code}, size={len(resp.content)}")
+                async with httpx.AsyncClient(timeout=30, follow_redirects=False, headers=headers) as client:
+                    current_url = url
+                    for _ in range(5):
+                        async with client.stream("GET", current_url) as resp:
+                            if resp.status_code in (301, 302, 303, 307, 308):
+                                location = resp.headers.get("location", "")
+                                next_url = urljoin(current_url, location)
+                                if not next_url or not self._is_allowed_media_url(next_url, platform):
+                                    logger.warning(f"图片下载重定向到非允许域名: {next_url[:100]}")
+                                    return None
+                                current_url = next_url
+                                continue
+
+                            content_length = resp.headers.get("content-length")
+                            if content_length:
+                                try:
+                                    content_size = int(content_length)
+                                except ValueError:
+                                    content_size = 0
+                                if content_size > self.MAX_IMAGE_BYTES:
+                                    logger.warning(f"图片下载超过大小限制: {current_url[:80]}, size={content_size:,}")
+                                    return None
+
+                            if resp.status_code == 200:
+                                total_size = 0
+                                with open(filepath, "wb") as f:
+                                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                                        f.write(chunk)
+                                        total_size += len(chunk)
+                                        if total_size > self.MAX_IMAGE_BYTES:
+                                            break
+                                if total_size > self.MAX_IMAGE_BYTES:
+                                    try:
+                                        os.remove(filepath)
+                                    except Exception:
+                                        pass
+                                    logger.warning(f"图片下载超过大小限制，中止: {current_url[:80]}")
+                                    return None
+                                if total_size > 100:
+                                    logger.debug(f"图片下载成功: {current_url[:80]} → {os.path.basename(filepath)} ({total_size:,} bytes)")
+                                    return filepath
+                                try:
+                                    os.remove(filepath)
+                                except Exception:
+                                    pass
+                            logger.debug(f"图片下载响应异常: {current_url[:80]}, status={resp.status_code}")
+                            break
             except Exception as e:
                 logger.debug(f"图片下载请求失败(尝试{attempt+1}/{retries}): {url[:80]}: {e}")
             if attempt < retries - 1:
@@ -99,6 +161,9 @@ class MediaService:
         """下载图片到本地，返回相对路径。保留原始格式。"""
         if not url or url.startswith("/static/"):
             return url
+        if not self._is_allowed_media_url(url, platform):
+            logger.warning(f"图片URL域名不在允许列表，跳过下载: {url[:100]}")
+            return None
         try:
             ext = self._guess_ext(url)
             filename = f"{uuid.uuid4().hex}{ext}"
@@ -119,7 +184,7 @@ class MediaService:
             urls_to_try = self._build_qq_cdn_fallbacks(url) if "photo.store.qq.com" in url else [url]
 
             for try_url in urls_to_try:
-                actual_path = await self._try_download_one(try_url, headers, filepath)
+                actual_path = await self._try_download_one(try_url, headers, filepath, platform)
                 if actual_path:
                     actual_filename = os.path.basename(actual_path)
                     return f"/static/{rel_prefix}/{actual_filename}"
@@ -167,6 +232,9 @@ class MediaService:
         """下载视频到本地，返回相对路径。支持大文件流式下载。"""
         if not url or url.startswith("/static/"):
             return url
+        if not self._is_allowed_media_url(url, platform):
+            logger.warning(f"视频URL域名不在允许列表，跳过下载: {url[:100]}")
+            return None
         try:
             ext = self._guess_video_ext(url)
             filename = f"{uuid.uuid4().hex}{ext}"
@@ -182,28 +250,57 @@ class MediaService:
 
             for attempt in range(3):
                 try:
-                    async with httpx.AsyncClient(
-                        timeout=120, follow_redirects=True, verify=False, headers=headers
-                    ) as client:
-                        async with client.stream("GET", url) as resp:
-                            if resp.status_code not in (200, 206):
-                                logger.debug(f"视频下载响应异常: {url[:80]}, status={resp.status_code}")
-                                continue
+                    async with httpx.AsyncClient(timeout=120, follow_redirects=False, headers=headers) as client:
+                        current_url = url
+                        for _ in range(5):
+                            async with client.stream("GET", current_url) as resp:
+                                if resp.status_code in (301, 302, 303, 307, 308):
+                                    location = resp.headers.get("location", "")
+                                    next_url = urljoin(current_url, location)
+                                    if not next_url or not self._is_allowed_media_url(next_url, platform):
+                                        logger.warning(f"视频下载重定向到非允许域名: {next_url[:100]}")
+                                        break
+                                    current_url = next_url
+                                    continue
+                                if not self._is_allowed_media_url(str(resp.url), platform):
+                                    logger.warning(f"视频下载重定向到非允许域名: {str(resp.url)[:100]}")
+                                    break
+                                if resp.status_code not in (200, 206):
+                                    logger.debug(f"视频下载响应异常: {current_url[:80]}, status={resp.status_code}")
+                                    break
+                                content_length = resp.headers.get("content-length")
+                                if content_length:
+                                    try:
+                                        content_size = int(content_length)
+                                    except ValueError:
+                                        content_size = 0
+                                    if content_size > self.MAX_VIDEO_BYTES:
+                                        logger.warning(f"视频下载超过大小限制: {current_url[:80]}, size={content_size:,}")
+                                        break
 
-                            total_size = 0
-                            with open(filepath, "wb") as f:
-                                async for chunk in resp.aiter_bytes(chunk_size=65536):
-                                    f.write(chunk)
-                                    total_size += len(chunk)
-                            if total_size > 1000:
-                                logger.info(f"视频下载成功: {url[:60]} → {filename} ({total_size:,} bytes)")
-                                return f"/static/{rel_prefix}/{filename}"
-                            else:
-                                logger.debug(f"视频文件过小({total_size}B)，可能无效: {url[:80]}")
+                                total_size = 0
+                                with open(filepath, "wb") as f:
+                                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                                        f.write(chunk)
+                                        total_size += len(chunk)
+                                        if total_size > self.MAX_VIDEO_BYTES:
+                                            logger.warning(f"视频下载超过大小限制，中止: {current_url[:80]}")
+                                            break
+                                if total_size > self.MAX_VIDEO_BYTES:
+                                    try:
+                                        os.remove(filepath)
+                                    except Exception:
+                                        pass
+                                    break
+                                if total_size > 1000:
+                                    logger.info(f"视频下载成功: {current_url[:60]} → {filename} ({total_size:,} bytes)")
+                                    return f"/static/{rel_prefix}/{filename}"
+                                logger.debug(f"视频文件过小({total_size}B)，可能无效: {current_url[:80]}")
                                 try:
                                     os.remove(filepath)
                                 except Exception:
                                     pass
+                                break
                 except Exception as e:
                     logger.debug(f"视频下载失败(尝试{attempt+1}/3): {url[:80]}: {e}")
                 if attempt < 2:

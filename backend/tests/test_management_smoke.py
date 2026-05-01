@@ -47,7 +47,7 @@ from app import security
 from app.config import settings
 from app.models.account import Account
 from app.models.system_config import SystemConfig
-from app.routers import ai_chat, ai_tasks, system, ws
+from app.routers import ai_chat, ai_tasks, qq, system, ws
 from app.schemas import AITaskCreate, ChatMessageCreate
 from app.services.account_risk_service import (
     DEGRADED_STATUS,
@@ -196,7 +196,9 @@ class AdminBoundarySmokeTests(unittest.TestCase):
         settings.secret_key = "bootstrap-secret"
 
         app = FastAPI()
+        app.include_router(ai_chat.router, prefix="/api/chat")
         app.include_router(system.router, prefix="/api/system")
+        app.include_router(qq.router, prefix="/api/qq")
         app.include_router(ws.router)
         self.client = TestClient(app)
 
@@ -217,6 +219,17 @@ class AdminBoundarySmokeTests(unittest.TestCase):
             headers={"Authorization": "Bearer admin-secret"},
         )
         self.assertEqual(authorized.status_code, 200)
+
+    def test_qq_crawl_requires_admin_token(self):
+        unauthorized = self.client.post(
+            "/api/qq/crawl",
+            json={"account_ids": ["10001"], "mode": "incremental"},
+        )
+        self.assertEqual(unauthorized.status_code, 401)
+
+    def test_chat_route_requires_admin_token(self):
+        unauthorized = self.client.get("/api/chat/sessions")
+        self.assertEqual(unauthorized.status_code, 401)
 
     def test_system_route_falls_back_to_secret_key_when_admin_token_missing(self):
         settings.admin_api_token = ""
@@ -679,6 +692,7 @@ class TaskSchedulerRiskControlTests(unittest.IsolatedAsyncioTestCase):
         xhs_crawler.start_crawl.assert_awaited_once_with(
             [xhs_target.account_id],
             login_account_id=xhs_login.id,
+            allow_degraded_login=False,
         )
 
 

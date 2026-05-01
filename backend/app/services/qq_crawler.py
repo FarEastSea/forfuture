@@ -4,6 +4,7 @@ import uuid
 import json
 import re
 import base64
+import hashlib
 import aiohttp
 import ssl
 import time
@@ -27,6 +28,9 @@ def compute_g_tk(p_skey: str) -> int:
 class QQCrawler:
     def __init__(self):
         self._status = {"running": False, "task_id": None, "progress": "", "error": None, "details": []}
+        self._crawl_lock = asyncio.Lock()
+        self._active_task: asyncio.Task | None = None
+        self._max_api_pages = max(1, int(os.getenv("QQ_CRAWL_MAX_PAGES", "150")))
         self.login_status = "unknown"
         self.login_status_detail = ""
         self._browser_context = None  # Playwright context for QR login
@@ -150,6 +154,16 @@ class QQCrawler:
 
     async def navigate_to(self, url: str) -> dict:
         """导航浏览器到指定URL"""
+        def is_allowed_navigation_url(candidate_url: str) -> bool:
+            parsed = urllib.parse.urlparse(candidate_url)
+            hostname = (parsed.hostname or "").lower()
+            allowed_suffixes = ("qq.com", "qzone.qq.com", "qpic.cn", "qlogo.cn", "gtimg.cn", "gtimg.com")
+            return parsed.scheme in {"http", "https"} and any(
+                hostname == suffix or hostname.endswith(f".{suffix}") for suffix in allowed_suffixes
+            )
+
+        if not is_allowed_navigation_url(url):
+            return {"ok": False, "error": "仅允许导航到 QQ/Qzone 相关域名"}
         if not self._browser_context:
             return {"ok": False, "error": "浏览器未启动"}
         page = self._browser_context.get("page")
@@ -157,8 +171,16 @@ class QQCrawler:
             return {"ok": False, "error": "页面不可用"}
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            if not is_allowed_navigation_url(page.url):
+                await page.goto("https://user.qzone.qq.com/", wait_until="domcontentloaded", timeout=8000)
+                return {"ok": False, "url": page.url, "error": "导航被重定向到非允许域名，已中止"}
             return {"ok": True, "url": page.url}
         except Exception as e:
+            try:
+                if page.url and not is_allowed_navigation_url(page.url):
+                    await page.goto("https://user.qzone.qq.com/", wait_until="domcontentloaded", timeout=8000)
+            except Exception:
+                pass
             logger.warning(f"QQ导航失败: {e}")
             return {"ok": False, "url": page.url, "error": str(e)}
 
@@ -1437,12 +1459,22 @@ class QQCrawler:
         login_account_id: int | None = None,
         allow_degraded_login: bool = False,
     ) -> str:
+        if self._status.get("running"):
+            raise RuntimeError("已有QQ空间抓取任务正在运行，请等待完成后再启动")
+
         task_id = uuid.uuid4().hex[:8]
-        self._status = {"running": True, "task_id": task_id, "progress": "启动中...", "error": None, "details": []}
+        self._status = {
+            "running": True,
+            "task_id": task_id,
+            "progress": "启动中...",
+            "error": None,
+            "details": [],
+            "results": [],
+        }
         self._crawl_mode = mode  # "incremental" or "overwrite"
         self._log(f"QQ抓取任务启动: task_id={task_id}, QQ号={qq_numbers}, 模式={mode}")
-        asyncio.create_task(
-            self._crawl_task(
+        self._active_task = asyncio.create_task(
+            self._run_crawl_locked(
                 qq_numbers,
                 task_id,
                 login_account_id=login_account_id,
@@ -1450,6 +1482,47 @@ class QQCrawler:
             )
         )
         return task_id
+
+    async def wait_for_task(self, task_id: str | None = None) -> dict:
+        task = self._active_task
+        if task and (task_id is None or self._status.get("task_id") == task_id):
+            await task
+        return self._status
+
+    async def run_crawl(
+        self,
+        qq_numbers: list[str],
+        mode: str = "incremental",
+        login_account_id: int | None = None,
+        allow_degraded_login: bool = False,
+    ) -> dict:
+        task_id = await self.start_crawl(
+            qq_numbers,
+            mode=mode,
+            login_account_id=login_account_id,
+            allow_degraded_login=allow_degraded_login,
+        )
+        return await self.wait_for_task(task_id)
+
+    async def _run_crawl_locked(
+        self,
+        qq_numbers: list[str],
+        task_id: str,
+        *,
+        login_account_id: int | None = None,
+        allow_degraded_login: bool = False,
+    ):
+        async with self._crawl_lock:
+            try:
+                await self._crawl_task(
+                    qq_numbers,
+                    task_id,
+                    login_account_id=login_account_id,
+                    allow_degraded_login=allow_degraded_login,
+                )
+            finally:
+                if self._status.get("task_id") == task_id:
+                    self._active_task = None
 
     async def _crawl_task(
         self,
@@ -1528,6 +1601,151 @@ class QQCrawler:
         self._log(f"已加载QQ Cookie（uin={uin}, g_tk={g_tk}, 使用{used_key}）")
         return cookies_dict, g_tk, uin
 
+    def _build_post_id(self, qq: str, msg: dict) -> str:
+        tid = str(msg.get("tid") or "").strip()
+        if tid:
+            return f"qz_{qq}_{tid}"
+
+        created_time = str(msg.get("created_time") or "").strip()
+        raw_fingerprint = json.dumps(
+            {
+                "created_time": created_time,
+                "content": msg.get("content", ""),
+                "source_name": msg.get("source_name", ""),
+                "pic": msg.get("pic", []),
+                "video": msg.get("video", []),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        digest = hashlib.sha1(raw_fingerprint.encode("utf-8")).hexdigest()[:12]
+        return f"qz_{qq}_{created_time or 'unknown'}_{digest}"
+
+    def _build_comment_id(self, cmt: dict) -> str:
+        cmt_id = str(cmt.get("tid") or "").strip()
+        if cmt_id:
+            return cmt_id
+
+        raw_fingerprint = json.dumps(
+            {
+                "uin": cmt.get("uin", ""),
+                "name": cmt.get("name", ""),
+                "content": cmt.get("content", ""),
+                "create_time": cmt.get("create_time", ""),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        return hashlib.sha1(raw_fingerprint.encode("utf-8")).hexdigest()[:16]
+
+    async def _save_qq_comments(self, db, post, comments: list[dict]) -> int:
+        if not comments:
+            return 0
+
+        from app.models.qq_post import QQComment
+        from sqlalchemy import select
+
+        await db.flush()
+        existing_result = await db.execute(
+            select(QQComment).where(QQComment.post_id == post.id)
+        )
+        existing_cmts = {c.comment_id: c for c in existing_result.scalars().all() if c.comment_id}
+        added = 0
+        for cmt in comments:
+            cmt_id = self._build_comment_id(cmt)
+            if not cmt_id:
+                continue
+
+            comment_time = None
+            if cmt.get("create_time"):
+                try:
+                    comment_time = datetime.fromtimestamp(int(cmt["create_time"]))
+                except (ValueError, OSError, TypeError):
+                    pass
+
+            existing = existing_cmts.get(cmt_id)
+            if existing:
+                existing.author_qq = str(cmt.get("uin", "")) or existing.author_qq
+                existing.author_nickname = cmt.get("name", "") or existing.author_nickname
+                existing.content = cmt.get("content", "") or existing.content
+                existing.comment_time = comment_time or existing.comment_time
+                continue
+
+            comment = QQComment(
+                post_id=post.id,
+                comment_id=cmt_id,
+                author_qq=str(cmt.get("uin", "")),
+                author_nickname=cmt.get("name", ""),
+                content=cmt.get("content", ""),
+                comment_time=comment_time,
+            )
+            db.add(comment)
+            existing_cmts[cmt_id] = comment
+            added += 1
+        return added
+
+    async def _fetch_qq_detail_comments(self, session: aiohttp.ClientSession, qq: str, tid: str, g_tk: int) -> list[dict]:
+        """Best-effort supplement for posts whose embedded commentlist is truncated."""
+        if not tid:
+            return []
+
+        detail_url = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msgdetail_v6"
+        collected: list[dict] = []
+        seen: set[str] = set()
+        pos = 0
+        for _ in range(20):
+            params = {
+                "uin": qq,
+                "tid": tid,
+                "ftype": 0,
+                "sort": 0,
+                "pos": pos,
+                "num": 100,
+                "replynum": 100,
+                "g_tk": g_tk,
+                "callback": "_preloadCallback",
+                "code_version": 1,
+                "format": "jsonp",
+                "need_private_comment": 1,
+            }
+            try:
+                async with session.get(detail_url, params=params) as resp:
+                    text = await resp.text()
+                match = re.search(r'_preloadCallback\((.*)\)', text, re.DOTALL)
+                if not match:
+                    break
+                data = json.loads(match.group(1))
+            except Exception as exc:
+                self._log(f"QQ={qq} 说说 {tid} 评论补拉失败: {exc}", "warning")
+                break
+
+            if data.get("code", 0) not in (0, None):
+                self._log(f"QQ={qq} 说说 {tid} 评论补拉返回 code={data.get('code')}", "warning")
+                break
+
+            comments = (
+                data.get("commentlist")
+                or data.get("comments")
+                or (data.get("msg") or {}).get("commentlist")
+                or []
+            )
+            new_count = 0
+            for cmt in comments:
+                cmt_id = self._build_comment_id(cmt)
+                if cmt_id and cmt_id not in seen:
+                    seen.add(cmt_id)
+                    collected.append(cmt)
+                    new_count += 1
+
+            if len(comments) < 100 or new_count == 0:
+                break
+            pos += 100
+            await asyncio.sleep(0.25)
+
+        return collected
+
     async def _crawl_via_api(
         self,
         qq_numbers: list[str],
@@ -1550,6 +1768,7 @@ class QQCrawler:
         from app.models.qq_post import QQPost, QQComment
         from app.services.media_service import media_service
         from sqlalchemy import select
+        from sqlalchemy.exc import IntegrityError
 
         url = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6"
         headers = {
@@ -1566,12 +1785,15 @@ class QQCrawler:
 
         async with aiohttp.ClientSession(cookies=cookies_dict, headers=headers, connector=connector) as session:
             any_success = False
+            had_terminal_error = False
             for qq in qq_numbers:
                 self._status["progress"] = f"正在抓取 {qq}..."
                 self._log(f"开始抓取 QQ={qq} 说说")
                 total_fetched = 0
                 saved_count = 0
                 updated_count = 0
+                target_error = None
+                stop_reason = "unknown"
 
                 try:
                     pos = 0
@@ -1607,6 +1829,7 @@ class QQCrawler:
                                 else:
                                     self._status["error"] = f"QQ空间API响应异常：Cookie可能已过期，请重新扫码登录。"
                                 await self._notify_cookie_expired("QQ空间", f"JSONP解析失败，响应前100字符: {resp_preview[:100]}")
+                            target_error = "jsonp_parse_failed"
                             break
 
                         data = json.loads(match.group(1))
@@ -1616,6 +1839,7 @@ class QQCrawler:
                             if code == -3000:
                                 self._status["error"] = "QQ空间Cookie已过期，请重新扫码登录。"
                                 await self._notify_cookie_expired("QQ空间", f"API返回 code={code}")
+                            target_error = f"api_code_{code}"
                             break
 
                         msglist = data.get("msglist")
@@ -1623,6 +1847,7 @@ class QQCrawler:
                             empty_pages += 1
                             self._log(f"QQ={qq} 页{page_num}: 无更多说说")
                             if empty_pages >= 2:
+                                stop_reason = "empty_pages"
                                 break
                             pos += 40
                             page_num += 1
@@ -1636,12 +1861,32 @@ class QQCrawler:
                         async with async_session() as db:
                             for msg in msglist:
                                 tid = msg.get("tid", "")
-                                post_id = f"qz_{qq}_{tid}" if tid else f"qz_{qq}_{msg.get('created_time', '')}"
+                                post_id = self._build_post_id(qq, msg)
+                                legacy_post_id = ""
+                                if not tid and msg.get("created_time"):
+                                    legacy_post_id = f"qz_{qq}_{msg.get('created_time', '')}"
 
+                                post_id_candidates = [post_id]
+                                if legacy_post_id and legacy_post_id != post_id:
+                                    post_id_candidates.append(legacy_post_id)
                                 existing_result = await db.execute(
-                                    select(QQPost).where(QQPost.post_id == post_id)
+                                    select(QQPost).where(QQPost.post_id.in_(post_id_candidates))
                                 )
-                                existing_post = existing_result.scalar_one_or_none()
+                                candidate_posts = existing_result.scalars().all()
+                                existing_post = next((p for p in candidate_posts if p.post_id == post_id), None)
+                                legacy_post = next((p for p in candidate_posts if p.post_id == legacy_post_id), None)
+                                if existing_post and legacy_post and existing_post.id != legacy_post.id:
+                                    legacy_comments = await db.execute(
+                                        select(QQComment).where(QQComment.post_id == legacy_post.id)
+                                    )
+                                    for comment in legacy_comments.scalars().all():
+                                        comment.post_id = existing_post.id
+                                    await db.delete(legacy_post)
+                                    self._log(f"QQ说说 {legacy_post_id} 已合并到规范ID {post_id}", "warning")
+                                elif legacy_post:
+                                    existing_post = legacy_post
+                                if existing_post and existing_post.post_id == legacy_post_id:
+                                    existing_post.post_id = post_id
 
                                 # 通用字段提取
                                 new_content = msg.get("content", "")
@@ -1785,24 +2030,18 @@ class QQCrawler:
 
                                     # 增量更新评论
                                     commentlist = msg.get("commentlist") or []
-                                    if commentlist:
-                                        await db.flush()  # 确保existing_post.id可用
-                                        existing_cmt_result = await db.execute(
-                                            select(QQComment).where(QQComment.post_id == existing_post.id)
-                                        )
-                                        existing_cmts = {c.comment_id: c for c in existing_cmt_result.scalars().all()}
-                                        for cmt in commentlist:
-                                            cmt_id = str(cmt.get("tid", ""))
-                                            if cmt_id and cmt_id not in existing_cmts:
-                                                comment = QQComment(
-                                                    post_id=existing_post.id,
-                                                    comment_id=cmt_id,
-                                                    author_qq=str(cmt.get("uin", "")),
-                                                    author_nickname=cmt.get("name", ""),
-                                                    content=cmt.get("content", ""),
-                                                    comment_time=datetime.fromtimestamp(cmt["create_time"]) if cmt.get("create_time") else None,
-                                                )
-                                                db.add(comment)
+                                    all_comments = list(commentlist)
+                                    if tid and new_comment > len(commentlist):
+                                        all_comments.extend(await self._fetch_qq_detail_comments(session, qq, tid, g_tk))
+                                    if all_comments:
+                                        added_comments = await self._save_qq_comments(db, existing_post, all_comments)
+                                        if new_comment > len(all_comments):
+                                            self._log(
+                                                f"QQ说说 {post_id} 评论可能未完全补齐: 标记{new_comment}条，已获取{len(all_comments)}条",
+                                                "warning",
+                                            )
+                                        elif added_comments:
+                                            self._log(f"QQ说说 {post_id} 新增评论 {added_comments} 条")
 
                                     updated_count += 1
                                     continue
@@ -1875,20 +2114,28 @@ class QQCrawler:
                                 db.add(post)
                                 saved_count += 1
 
-                                # 保存评论
-                                for cmt in msg.get("commentlist", []) or []:
-                                    await db.flush()
-                                    comment = QQComment(
-                                        post_id=post.id,
-                                        comment_id=str(cmt.get("tid", "")),
-                                        author_qq=str(cmt.get("uin", "")),
-                                        author_nickname=cmt.get("name", ""),
-                                        content=cmt.get("content", ""),
-                                        comment_time=datetime.fromtimestamp(cmt["create_time"]) if cmt.get("create_time") else None,
-                                    )
-                                    db.add(comment)
+                                # 保存评论；嵌入评论不足时尝试补拉详情页评论分页
+                                commentlist = msg.get("commentlist", []) or []
+                                all_comments = list(commentlist)
+                                if tid and new_comment > len(commentlist):
+                                    all_comments.extend(await self._fetch_qq_detail_comments(session, qq, tid, g_tk))
+                                if all_comments:
+                                    await self._save_qq_comments(db, post, all_comments)
+                                    if new_comment > len(all_comments):
+                                        self._log(
+                                            f"QQ说说 {post_id} 评论可能未完全补齐: 标记{new_comment}条，已获取{len(all_comments)}条",
+                                            "warning",
+                                        )
 
-                            await db.commit()
+                            try:
+                                await db.commit()
+                            except IntegrityError as exc:
+                                await db.rollback()
+                                self._log(f"QQ={qq} 页{page_num}: 数据唯一性冲突，已跳过本页异常记录: {exc}", "warning")
+                                self._status["error"] = "QQ空间落库发生唯一性冲突，本轮该账号数据未完整保存。"
+                                target_error = "db_integrity_error"
+                                had_terminal_error = True
+                                break
 
                         pos += 40
                         page_num += 1
@@ -1896,17 +2143,41 @@ class QQCrawler:
                         # 如果返回数量少于请求数量，说明到底了
                         if len(msglist) < 40:
                             self._log(f"QQ={qq} 页{page_num}: 返回{len(msglist)}条 < 40，到底了")
+                            stop_reason = "bottom"
                             break
 
                         # 安全上限防止无限循环
-                        if page_num >= 100:
-                            self._log(f"QQ={qq} 达到100页上限")
+                        if page_num >= self._max_api_pages:
+                            self._log(f"QQ={qq} 达到{self._max_api_pages}页上限", "warning")
+                            stop_reason = "page_limit_reached"
                             break
 
                         await asyncio.sleep(0.5)  # 避免请求过快
 
-                    self._log(f"QQ={qq} 抓取完成: 总计 {total_fetched} 条，新增 {saved_count} 条，更新 {updated_count} 条")
+                    if target_error:
+                        self._log(f"QQ={qq} 抓取未完成: {target_error}", "warning")
+                        self._status["progress"] = f"{qq}: 抓取未完成 ({target_error})"
+                        self._status.setdefault("results", []).append({
+                            "account_id": qq,
+                            "status": "failed",
+                            "reason": target_error,
+                            "fetched": total_fetched,
+                            "saved": saved_count,
+                            "updated": updated_count,
+                        })
+                        continue
+
+                    self._log(f"QQ={qq} 抓取完成: 总计 {total_fetched} 条，新增 {saved_count} 条，更新 {updated_count} 条，停止原因={stop_reason}")
                     self._status["progress"] = f"{qq}: 获取 {total_fetched} 条，新增 {saved_count}，更新 {updated_count}"
+                    self._status.setdefault("results", []).append({
+                        "account_id": qq,
+                        "status": "empty" if total_fetched == 0 else "success",
+                        "fetched": total_fetched,
+                        "saved": saved_count,
+                        "updated": updated_count,
+                        "stop_reason": stop_reason,
+                        "page_limit": self._max_api_pages if stop_reason == "page_limit_reached" else None,
+                    })
                     any_success = True
 
                     # ---- 同步头像/昵称到 Account 表 ----
@@ -1941,8 +2212,13 @@ class QQCrawler:
                 except Exception as e:
                     self._log(f"抓取 {qq} 失败: {e}", "error")
                     self._status["progress"] = f"抓取 {qq} 失败: {str(e)}"
+                    self._status.setdefault("results", []).append({
+                        "account_id": qq,
+                        "status": "failed",
+                        "reason": str(e),
+                    })
 
-        return any_success
+            return any_success or had_terminal_error
 
     # ===================== Playwright DOM 解析（备用方案）=====================
 

@@ -8,6 +8,11 @@
             {{ a.nickname || a.account_id }}
           </a-option>
         </a-select>
+        <a-select v-model="selectedLoginAccountId" placeholder="自动选择登录账号" allow-clear style="width: 190px">
+          <a-option v-for="a in loginAccounts" :key="a.id" :value="a.id">
+            {{ a.nickname || a.account_id }}
+          </a-option>
+        </a-select>
         <a-radio-group v-model="crawlMode" type="button" size="small" style="margin-right: 8px;">
           <a-radio value="incremental">增量更新</a-radio>
           <a-radio value="overwrite">覆盖更新</a-radio>
@@ -137,12 +142,14 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
 import { Message } from '@arco-design/web-vue'
-import { qqApi } from '@/api'
+import { authApi, qqApi } from '@/api'
 import { IconSync, IconHeart, IconMessage, IconEmpty } from '@arco-design/web-vue/es/icon'
 
 const posts = ref<any[]>([])
 const accounts = ref<any[]>([])
+const loginAccounts = ref<any[]>([])
 const selectedQQ = ref<string>('')
+const selectedLoginAccountId = ref<number | undefined>(undefined)
 const loading = ref(false)
 const crawling = ref(false)
 const postsError = ref('')
@@ -180,6 +187,15 @@ async function loadAccounts() {
   }
 }
 
+async function loadLoginAccounts() {
+  try {
+    const { data } = await authApi.getAccounts('qq')
+    loginAccounts.value = (data || []).filter((a: any) => a.is_target === 0)
+  } catch (error) {
+    Message.error(getErrorMessage(error, 'QQ登录账号加载失败，请检查设置页配置。'))
+  }
+}
+
 async function startCrawl() {
   const ids = accounts.value.map((a: any) => a.account_id)
   if (ids.length === 0) {
@@ -188,7 +204,9 @@ async function startCrawl() {
   }
   crawling.value = true
   try {
-    await qqApi.crawl(ids, crawlMode.value)
+    await qqApi.crawl(ids, crawlMode.value, {
+      login_account_id: selectedLoginAccountId.value || undefined,
+    })
     pollCrawlStatus()
   } catch (error) {
     crawling.value = false
@@ -303,6 +321,7 @@ function getCurrentNickname(post: any): string {
 
 onMounted(() => {
   loadAccounts()
+  loadLoginAccounts()
   loadPosts()
 })
 

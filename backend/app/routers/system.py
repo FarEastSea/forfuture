@@ -119,6 +119,24 @@ def _restore_env_snapshot(snapshot: str | None) -> None:
     temp_env_file.replace(ENV_FILE)
 
 
+async def _get_config_value(db: AsyncSession, key: str, default: str) -> str:
+    result = await db.execute(select(SystemConfig).where(SystemConfig.key == key))
+    config = result.scalar_one_or_none()
+    return config.value if config and config.value is not None else default
+
+
+async def _sync_auto_crawl_schedule(db: AsyncSession) -> None:
+    enabled_value = await _get_config_value(db, "auto_crawl_enabled", "true")
+    interval_value = await _get_config_value(db, "auto_crawl_interval", "60")
+    try:
+        interval = max(1, int(interval_value))
+    except (TypeError, ValueError):
+        interval = 60
+
+    from app.services.task_scheduler import scheduler_service
+    scheduler_service.configure_auto_crawl(enabled_value != "false", interval)
+
+
 @router.get("/configs")
 async def get_system_configs(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(SystemConfig).order_by(SystemConfig.key))
@@ -189,6 +207,9 @@ async def update_system_configs(items: List[SystemConfigItem] = Body(...), db: A
             _sync_env_settings(env_updates)
 
         await db.commit()
+
+        if any(item.key in {"auto_crawl_enabled", "auto_crawl_interval"} for item in items):
+            await _sync_auto_crawl_schedule(db)
 
         logger.info(f"系统配置已更新: {[item.key for item in items]}")
         return {"message": "配置已更新"}

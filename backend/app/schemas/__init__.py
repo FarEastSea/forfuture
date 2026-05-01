@@ -37,6 +37,7 @@ class QQCommentOut(BaseModel):
 class CrawlRequest(BaseModel):
     account_ids: List[str]  # QQ号列表
     mode: str = "incremental"  # "incremental" or "overwrite"
+    login_account_id: Optional[int] = None
 
 
 class XHSNoteOut(BaseModel):
@@ -65,6 +66,7 @@ class XHSNoteOut(BaseModel):
 class XHSCrawlRequest(BaseModel):
     user_ids: List[str]
     mode: str = "incremental"  # "incremental" or "overwrite"
+    login_account_id: Optional[int] = None
 
 
 class AIConfigCreate(BaseModel):

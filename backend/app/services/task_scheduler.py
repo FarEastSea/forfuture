@@ -97,6 +97,8 @@ class TaskSchedulerService:
         from app.models.system_config import SystemConfig
         from sqlalchemy import select
 
+        interval = 60
+        enabled_value = "true"
         try:
             async with async_session() as db:
                 # 读取自动爬取配置
@@ -106,17 +108,17 @@ class TaskSchedulerService:
 
                 result2 = await db.execute(select(SystemConfig).where(SystemConfig.key == "auto_crawl_enabled"))
                 enabled = result2.scalar_one_or_none()
-                if enabled and enabled.value == "false":
-                    logger.info("自动爬取已禁用")
-                    return
+                enabled_value = enabled.value if enabled and enabled.value else "true"
 
-            self.register_auto_crawl(interval)
-            logger.info(f"自动爬取已启动，间隔 {interval} 分钟")
+            self.configure_auto_crawl(enabled_value != "false", interval)
         except Exception as e:
             # 首次启动可能没有配置，用默认值
-            self.register_auto_crawl(60)
+            self.configure_auto_crawl(True, 60)
             logger.info(f"自动爬取已启动（默认60分钟间隔）: {e}")
 
+        self._register_maintenance_jobs()
+
+    def _register_maintenance_jobs(self):
         # 注册Cookie自动续期任务（每4小时刷新一次QQ cookies）
         self.scheduler.add_job(
             self._cookie_refresh_wrapper,
@@ -135,6 +137,15 @@ class TaskSchedulerService:
         )
         logger.info("动态总结定时任务已注册（每周一凌晨3:00）")
 
+    def configure_auto_crawl(self, enabled: bool, interval_minutes: int):
+        job_id = "auto_crawl"
+        if self.scheduler.get_job(job_id):
+            self.scheduler.remove_job(job_id)
+        if not enabled:
+            logger.info("自动爬取已禁用")
+            return
+        self.register_auto_crawl(interval_minutes)
+
     def register_auto_crawl(self, interval_minutes: int):
         job_id = "auto_crawl"
         if self.scheduler.get_job(job_id):
@@ -144,7 +155,9 @@ class TaskSchedulerService:
             trigger=IntervalTrigger(minutes=interval_minutes),
             id=job_id,
             replace_existing=True,
+            max_instances=1,
         )
+        logger.info(f"自动爬取已启动，间隔 {interval_minutes} 分钟")
 
     async def _auto_crawl_wrapper(self):
         try:
@@ -284,7 +297,7 @@ class TaskSchedulerService:
                 db,
                 "xhs",
                 require_cookies=True,
-                allow_degraded=False,
+                allow_degraded=allow_degraded_for_crawl,
             )
 
         if qq_ids:
@@ -302,11 +315,21 @@ class TaskSchedulerService:
 
                 if refresh_ok:
                     logger.info(f"自动爬取QQ空间: {qq_ids}")
-                    await qq_crawler.start_crawl(
-                        qq_ids,
-                        login_account_id=qq_login_account.id,
-                        allow_degraded_login=allow_degraded_for_crawl,
-                    )
+                    try:
+                        if hasattr(qq_crawler, "run_crawl"):
+                            await qq_crawler.run_crawl(
+                                qq_ids,
+                                login_account_id=qq_login_account.id,
+                                allow_degraded_login=allow_degraded_for_crawl,
+                            )
+                        else:
+                            await qq_crawler.start_crawl(
+                                qq_ids,
+                                login_account_id=qq_login_account.id,
+                                allow_degraded_login=allow_degraded_for_crawl,
+                            )
+                    except RuntimeError as e:
+                        logger.warning(f"自动爬取: QQ抓取任务未启动: {e}")
                 else:
                     await self._mark_login_account_failure(
                         qq_login_account.id,
@@ -319,10 +342,21 @@ class TaskSchedulerService:
         if xhs_ids:
             if xhs_login_account:
                 logger.info(f"自动爬取小红书: {xhs_ids}")
-                await xhs_crawler.start_crawl(
-                    xhs_ids,
-                    login_account_id=xhs_login_account.id,
-                )
+                try:
+                    if hasattr(xhs_crawler, "run_crawl"):
+                        await xhs_crawler.run_crawl(
+                            xhs_ids,
+                            login_account_id=xhs_login_account.id,
+                            allow_degraded_login=allow_degraded_for_crawl,
+                        )
+                    else:
+                        await xhs_crawler.start_crawl(
+                            xhs_ids,
+                            login_account_id=xhs_login_account.id,
+                            allow_degraded_login=allow_degraded_for_crawl,
+                        )
+                except RuntimeError as e:
+                    logger.warning(f"自动爬取: 小红书抓取任务未启动: {e}")
             else:
                 logger.warning("自动爬取: 无可用的小红书登录账号，已跳过本轮小红书抓取")
 

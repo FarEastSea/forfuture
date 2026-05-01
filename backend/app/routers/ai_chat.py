@@ -5,8 +5,9 @@ from fastapi.responses import StreamingResponse
 from app.database import get_db, async_session
 from app.models.chat_history import ChatSession, ChatMessage
 from app.schemas import ChatMessageCreate, ChatSessionOut
+from app.security import require_admin_http
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_admin_http)])
 
 
 @router.get("/sessions")

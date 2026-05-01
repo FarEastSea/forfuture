@@ -215,7 +215,14 @@ async def get_xhs_note_detail(note_db_id: int, db: AsyncSession = Depends(get_db
 @router.post("/crawl")
 async def trigger_xhs_crawl(req: XHSCrawlRequest):
     from app.services.xhs_crawler import xhs_crawler
-    task_id = await xhs_crawler.start_crawl(req.user_ids, mode=req.mode)
+    try:
+        task_id = await xhs_crawler.start_crawl(
+            req.user_ids,
+            mode=req.mode,
+            login_account_id=req.login_account_id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"task_id": task_id, "message": "抓取任务已启动"}
 
 
@@ -228,9 +235,17 @@ async def crawl_note_comments(note_db_id: int, db: AsyncSession = Depends(get_db
         raise HTTPException(status_code=404, detail="笔记不存在")
 
     from app.services.xhs_crawler import xhs_crawler
-    import asyncio
-    asyncio.create_task(xhs_crawler.crawl_single_note_comments(note.note_id))
-    return {"message": f"评论抓取任务已启动: {note.note_id}"}
+    try:
+        task_id = await xhs_crawler.start_comment_crawl(note.note_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"task_id": task_id, "message": f"评论抓取任务已启动: {note.note_id}"}
+
+
+@router.get("/comments/status")
+async def get_xhs_comment_crawl_status():
+    from app.services.xhs_crawler import xhs_crawler
+    return xhs_crawler.get_comment_status()
 
 
 @router.get("/crawl/status")

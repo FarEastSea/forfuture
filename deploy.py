@@ -498,7 +498,7 @@ fi
 
 cd "$CURRENT_BACKEND"
 nohup "$PY" -m gunicorn app.main:app -k uvicorn.workers.UvicornWorker \
-    --bind 0.0.0.0:$PORT --workers 2 --timeout 300 \
+    --bind 0.0.0.0:$PORT --workers 1 --timeout 300 \
     --pid "$PID_FILE" --access-logfile - --error-logfile - \
     > /var/log/ai_records_gunicorn.log 2>&1 &
 

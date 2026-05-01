@@ -21,7 +21,8 @@ api.interceptors.request.use((config) => {
 export const qqApi = {
   getPosts: (params?: any) => api.get('/qq/posts', { params }),
   getPost: (id: number) => api.get(`/qq/posts/${id}`),
-  crawl: (accountIds: string[], mode: string = 'incremental') => api.post('/qq/crawl', { account_ids: accountIds, mode }),
+  crawl: (accountIds: string[], mode: string = 'incremental', options: any = {}) =>
+    api.post('/qq/crawl', { account_ids: accountIds, mode, ...options }),
   getCrawlStatus: () => api.get('/qq/crawl/status'),
   getAccounts: () => api.get('/qq/accounts'),
 }
@@ -30,8 +31,10 @@ export const qqApi = {
 export const xhsApi = {
   getNotes: (params?: any) => api.get('/xhs/notes', { params }),
   getNote: (id: number) => api.get(`/xhs/notes/${id}`),
-  crawl: (userIds: string[], mode: string = 'incremental') => api.post('/xhs/crawl', { user_ids: userIds, mode }),
+  crawl: (userIds: string[], mode: string = 'incremental', options: any = {}) =>
+    api.post('/xhs/crawl', { user_ids: userIds, mode, ...options }),
   crawlNoteComments: (noteDbId: number) => api.post(`/xhs/notes/${noteDbId}/crawl-comments`),
+  getCommentStatus: () => api.get('/xhs/comments/status'),
   getCrawlStatus: () => api.get('/xhs/crawl/status'),
   getAccounts: () => api.get('/xhs/accounts'),
 }

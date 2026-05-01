@@ -73,6 +73,7 @@ XHS_PROXY_HOST_SUFFIXES = (
 )
 
 MAX_PROXY_REDIRECTS = 5
+MAX_PROXY_MEDIA_BYTES = 300 * 1024 * 1024
 
 
 def _is_allowed_proxy_host(hostname: str, allowed_suffixes: tuple[str, ...]) -> bool:
@@ -126,6 +127,8 @@ async def proxy_image(url: str, request: Request):
     response = None
     try:
         range_header = request.headers.get("range")
+        if range_header and not range_header.lower().startswith("bytes="):
+            range_header = None
         current_url = url
         redirect_count = 0
 
@@ -162,6 +165,17 @@ async def proxy_image(url: str, request: Request):
             await client.aclose()
             raise HTTPException(status_code=response.status_code, detail="Failed to fetch upstream media")
 
+        content_length = response.headers.get("content-length")
+        if content_length:
+            try:
+                content_size = int(content_length)
+            except ValueError:
+                content_size = 0
+            if content_size > MAX_PROXY_MEDIA_BYTES:
+                await response.aclose()
+                await client.aclose()
+                raise HTTPException(status_code=413, detail="Upstream media too large")
+
         passthrough_headers = {}
         for header_name in ("accept-ranges", "content-length", "content-range", "cache-control"):
             header_value = response.headers.get(header_name)
@@ -171,8 +185,12 @@ async def proxy_image(url: str, request: Request):
         content_type = response.headers.get("content-type", "application/octet-stream")
 
         async def iter_media():
+            streamed_bytes = 0
             try:
                 async for chunk in response.aiter_bytes():
+                    streamed_bytes += len(chunk)
+                    if streamed_bytes > MAX_PROXY_MEDIA_BYTES:
+                        break
                     yield chunk
             finally:
                 await response.aclose()

@@ -6,6 +6,7 @@ import re
 import os
 import shutil
 import base64
+from urllib.parse import urlparse
 from typing import Optional
 from datetime import datetime
 from app.config import settings
@@ -15,7 +16,12 @@ logger = logging.getLogger(__name__)
 
 class XHSCrawler:
     def __init__(self):
-        self._status = {"running": False, "task_id": None, "progress": "", "error": None}
+        self._status = {"running": False, "task_id": None, "progress": "", "error": None, "results": []}
+        self._comment_status = {"running": False, "task_id": None, "progress": "", "error": None, "note_id": None}
+        self._crawl_lock = asyncio.Lock()
+        self._comment_lock = asyncio.Lock()
+        self._active_task: asyncio.Task | None = None
+        self._active_comment_task: asyncio.Task | None = None
         self.login_status = "unknown"
         self.login_status_detail = ""
         self._browser_context = None
@@ -33,6 +39,9 @@ class XHSCrawler:
 
     def get_status(self) -> dict:
         return self._status
+
+    def get_comment_status(self) -> dict:
+        return self._comment_status
 
     def _debug_event(self, message: str):
         logger.info(f"[XHS-DEBUG] {message}")
@@ -152,6 +161,16 @@ class XHSCrawler:
 
     async def navigate_to(self, url: str) -> dict:
         """在当前浏览器页面中导航到指定URL"""
+        def is_allowed_navigation_url(candidate_url: str) -> bool:
+            parsed = urlparse(candidate_url)
+            hostname = (parsed.hostname or "").lower()
+            allowed_suffixes = ("xiaohongshu.com", "xhscdn.com")
+            return parsed.scheme in {"http", "https"} and any(
+                hostname == suffix or hostname.endswith(f".{suffix}") for suffix in allowed_suffixes
+            )
+
+        if not is_allowed_navigation_url(url):
+            return {"ok": False, "error": "仅允许导航到小红书相关域名"}
         if not self._browser_context:
             return {"ok": False, "error": "浏览器未启动"}
         page = self._browser_context.get("page")
@@ -159,8 +178,16 @@ class XHSCrawler:
             return {"ok": False, "error": "无可用页面"}
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            if not is_allowed_navigation_url(page.url):
+                await page.goto("https://www.xiaohongshu.com", wait_until="domcontentloaded", timeout=8000)
+                return {"ok": False, "url": page.url, "error": "导航被重定向到非允许域名，已中止"}
             return {"ok": True, "url": page.url}
         except Exception as e:
+            try:
+                if page.url and not is_allowed_navigation_url(page.url):
+                    await page.goto("https://www.xiaohongshu.com", wait_until="domcontentloaded", timeout=8000)
+            except Exception:
+                pass
             return {"ok": False, "error": str(e)}
 
     async def save_cookies_manual(self) -> dict:
@@ -346,11 +373,14 @@ class XHSCrawler:
         login_account_id: int | None = None,
         allow_degraded_login: bool = False,
     ) -> str:
+        if self._status.get("running"):
+            raise RuntimeError("已有小红书抓取任务正在运行，请等待完成后再启动")
+
         task_id = uuid.uuid4().hex[:8]
-        self._status = {"running": True, "task_id": task_id, "progress": "启动中...", "error": None}
+        self._status = {"running": True, "task_id": task_id, "progress": "启动中...", "error": None, "results": []}
         self._crawl_mode = mode  # "incremental" or "overwrite"
-        asyncio.create_task(
-            self._crawl_task(
+        self._active_task = asyncio.create_task(
+            self._run_crawl_locked(
                 user_ids,
                 task_id,
                 login_account_id=login_account_id,
@@ -358,6 +388,47 @@ class XHSCrawler:
             )
         )
         return task_id
+
+    async def wait_for_task(self, task_id: str | None = None) -> dict:
+        task = self._active_task
+        if task and (task_id is None or self._status.get("task_id") == task_id):
+            await task
+        return self._status
+
+    async def run_crawl(
+        self,
+        user_ids: list[str],
+        mode: str = "incremental",
+        login_account_id: int | None = None,
+        allow_degraded_login: bool = False,
+    ) -> dict:
+        task_id = await self.start_crawl(
+            user_ids,
+            mode=mode,
+            login_account_id=login_account_id,
+            allow_degraded_login=allow_degraded_login,
+        )
+        return await self.wait_for_task(task_id)
+
+    async def _run_crawl_locked(
+        self,
+        user_ids: list[str],
+        task_id: str,
+        *,
+        login_account_id: int | None = None,
+        allow_degraded_login: bool = False,
+    ):
+        async with self._crawl_lock:
+            try:
+                await self._crawl_task(
+                    user_ids,
+                    task_id,
+                    login_account_id=login_account_id,
+                    allow_degraded_login=allow_degraded_login,
+                )
+            finally:
+                if self._status.get("task_id") == task_id:
+                    self._active_task = None
 
     async def _crawl_task(
         self,
@@ -501,6 +572,11 @@ class XHSCrawler:
                     api_uid = await self._resolve_uid(uid, page)
                     if not api_uid:
                         logger.warning(f"XHS 无法解析用户 {uid}，跳过")
+                        self._status.setdefault("results", []).append({
+                            "account_id": uid,
+                            "status": "skipped",
+                            "reason": "resolve_uid_failed",
+                        })
                         continue
 
                     # 2. 通过多策略获取笔记（__INITIAL_STATE__ → DOM提取 → API拦截）
@@ -510,13 +586,25 @@ class XHSCrawler:
                         login_account_id=account.id,
                     )
                     if notes:
-                        source = "state_or_dom" if len(notes) > 0 else "api_intercept"
+                        source = "profile_merged"
                         await self._save_notes(uid, notes, source)
                         self._status["progress"] = f"{uid} 获取 {len(notes)} 条笔记"
                         logger.info(f"XHS抓取成功: {uid} → {api_uid}, {len(notes)} 条")
+                        self._status.setdefault("results", []).append({
+                            "account_id": uid,
+                            "status": "success",
+                            "fetched": len(notes),
+                            "platform_uid": api_uid,
+                        })
                         any_success = True
                     else:
                         logger.warning(f"XHS {uid} 所有方式均未获取到数据（__INITIAL_STATE__ + DOM + API拦截）")
+                        self._status.setdefault("results", []).append({
+                            "account_id": uid,
+                            "status": "empty",
+                            "fetched": 0,
+                            "platform_uid": api_uid,
+                        })
 
                     # ---- 同步监控账号昵称/头像/红薯号/个人简介 ----
                     try:
@@ -532,7 +620,7 @@ class XHSCrawler:
                             const redIdEl = document.querySelector('.user-redId, [class*="user-redId"]');
                             if (redIdEl) {
                                 const text = redIdEl.textContent || '';
-                                const m = text.match(/[：:]\s*(\S+)/);
+                                const m = text.match(/[：:]\\s*(\\S+)/);
                                 if (m) info.red_id = m[1];
                             }
                             // 头像: <img class="user-image" src="..."> (去掉模糊参数)
@@ -644,6 +732,11 @@ class XHSCrawler:
                     await asyncio.sleep(2)
                 except Exception as e:
                     logger.error(f"XHS抓取 {uid} 失败: {type(e).__name__}: {e}")
+                    self._status.setdefault("results", []).append({
+                        "account_id": uid,
+                        "status": "failed",
+                        "reason": f"{type(e).__name__}: {e}",
+                    })
 
             return any_success
         except Exception as e:
@@ -780,12 +873,6 @@ class XHSCrawler:
                         }
                     }
                 }
-                // 无精确匹配就返回第一个结果（搜索结果中最相关的）
-                for (const link of links) {
-                    const href = link.getAttribute('href') || link.href || '';
-                    const m = href.match(/\\/user\\/profile\\/([a-f0-9]{24})/);
-                    if (m) return m[1];
-                }
                 return '';
             }""", uid)
 
@@ -831,6 +918,18 @@ class XHSCrawler:
         seen_note_ids = set()
         has_more = True
         cookie_invalid_detected = False
+        stop_reason = "max_scrolls"
+
+        def add_captured_notes(notes: list[dict], source: str) -> int:
+            new_count = 0
+            for note in notes:
+                nid = note.get("note_id") or note.get("id", "")
+                if nid and nid not in seen_note_ids:
+                    seen_note_ids.add(nid)
+                    note.setdefault("_crawl_source", source)
+                    captured_notes.append(note)
+                    new_count += 1
+            return new_count
 
         async def on_profile_response(response):
             nonlocal has_more, cookie_invalid_detected
@@ -855,13 +954,7 @@ class XHSCrawler:
                         notes = data.get("notes", [])
                         if not notes and isinstance(data, list):
                             notes = data
-                        new_count = 0
-                        for note in notes:
-                            nid = note.get("note_id") or note.get("id", "")
-                            if nid and nid not in seen_note_ids:
-                                seen_note_ids.add(nid)
-                                captured_notes.append(note)
-                                new_count += 1
+                        new_count = add_captured_notes(notes, "api_intercept")
                         # 只从 user_posted 精确接口更新 has_more（避免 collect/page 等干扰）
                         if is_user_posted:
                             if not data.get("has_more", True) or len(notes) == 0:
@@ -933,8 +1026,8 @@ class XHSCrawler:
                 try:
                     state_notes = await self._extract_initial_state_notes(page)
                     if state_notes:
-                        logger.info(f"XHS 从__INITIAL_STATE__提取到 {len(state_notes)} 条笔记，跳过API拦截")
-                        return state_notes
+                        added = add_captured_notes(state_notes, "initial_state")
+                        logger.info(f"XHS 从__INITIAL_STATE__提取到 {len(state_notes)} 条笔记，新增 {added} 条，将继续滚动补齐")
                 except Exception as e_state:
                     logger.debug(f"XHS __INITIAL_STATE__提取失败: {e_state}")
 
@@ -943,8 +1036,8 @@ class XHSCrawler:
                 try:
                     dom_notes = await self._extract_notes_from_dom(page)
                     if dom_notes:
-                        logger.info(f"XHS 从DOM直接提取到 {len(dom_notes)} 条笔记ID，跳过API拦截")
-                        return dom_notes
+                        added = add_captured_notes(dom_notes, "dom_initial")
+                        logger.info(f"XHS 从DOM直接提取到 {len(dom_notes)} 条笔记ID，新增 {added} 条，将继续滚动补齐")
                 except Exception as e_dom:
                     logger.debug(f"XHS DOM提取失败: {e_dom}")
 
@@ -991,6 +1084,7 @@ class XHSCrawler:
                     return false;
                 }""")
                 if no_more or not has_more:
+                    stop_reason = "page_bottom" if no_more else "api_has_more_false"
                     logger.info(f"XHS 到达页面底部 (scroll #{scroll_i+1}, 共{len(captured_notes)}条)")
                     break
 
@@ -998,12 +1092,14 @@ class XHSCrawler:
                     consecutive_no_new += 1
                     await asyncio.sleep(1.5)
                     if consecutive_no_new >= 4:
+                        stop_reason = "consecutive_no_new"
                         logger.info(f"XHS 连续{consecutive_no_new}次滚动无新数据，停止")
                         break
                 else:
                     consecutive_no_new = 0
 
-            logger.info(f"XHS API拦截完成: 共获取 {len(captured_notes)} 条笔记")
+            logger.info(f"XHS API拦截完成: 共获取 {len(captured_notes)} 条笔记，停止原因={stop_reason}")
+            self._status["last_xhs_stop_reason"] = stop_reason
 
             # ========== 最终兜底: 再次尝试DOM提取 ==========
             if len(captured_notes) == 0:
@@ -1011,7 +1107,7 @@ class XHSCrawler:
                     dom_notes = await self._extract_notes_from_dom(page)
                     if dom_notes:
                         logger.info(f"XHS API拦截0条，DOM兜底提取到 {len(dom_notes)} 条笔记")
-                        captured_notes = dom_notes
+                        add_captured_notes(dom_notes, "dom_fallback")
                 except Exception as e_dom:
                     logger.debug(f"XHS DOM兜底提取失败: {e_dom}")
 
@@ -1900,6 +1996,109 @@ class XHSCrawler:
 
         logger.info(f"XHS {uid} 笔记详情获取完成: {success_count}/{len(note_ids)} 条成功")
 
+    async def _fetch_comment_pages_via_api(
+        self,
+        page,
+        note_id: str,
+        seen_comment_ids: set[str],
+        *,
+        max_pages: int = 30,
+        max_sub_pages: int = 20,
+    ) -> list[dict]:
+        """Use XHS signed in-page fetch to paginate comments beyond initially rendered data."""
+        try:
+            result = await page.evaluate(
+                """async ({noteId, maxPages, maxSubPages}) => {
+                    const all = [];
+                    const seen = new Set();
+                    const addComment = (comment, parentId = '') => {
+                        if (!comment || !comment.id || seen.has(comment.id)) return;
+                        seen.add(comment.id);
+                        if (parentId) comment._parent_comment_id = parentId;
+                        all.push(comment);
+                    };
+                    const signedFetch = async (apiPath) => {
+                        const headers = {'Referer': 'https://www.xiaohongshu.com/'};
+                        if (typeof window._webmsxyw === 'function') {
+                            try {
+                                const sign = window._webmsxyw(apiPath, void 0);
+                                if (sign) {
+                                    if (sign['X-s']) headers['X-s'] = sign['X-s'];
+                                    if (sign['X-t']) headers['X-t'] = sign['X-t'];
+                                    if (sign['X-s-common']) headers['X-s-common'] = sign['X-s-common'];
+                                }
+                            } catch(e) {}
+                        }
+                        const resp = await fetch('https://edith.xiaohongshu.com' + apiPath, {
+                            headers,
+                            credentials: 'include',
+                        });
+                        if (!resp.ok) return {ok: false, status: resp.status};
+                        try {
+                            const body = await resp.json();
+                            return {ok: true, body};
+                        } catch(e) {
+                            return {ok: false, status: resp.status, error: e.message};
+                        }
+                    };
+
+                    let cursor = '';
+                    for (let pageIndex = 0; pageIndex < maxPages; pageIndex++) {
+                        const apiPath = '/api/sns/web/v2/comment/page?note_id=' + encodeURIComponent(noteId)
+                            + '&cursor=' + encodeURIComponent(cursor)
+                            + '&top_comment_id=&image_formats=jpg,webp,avif';
+                        const result = await signedFetch(apiPath);
+                        if (!result.ok) break;
+                        const data = (result.body && result.body.data) || {};
+                        const comments = data.comments || [];
+                        for (const comment of comments) {
+                            addComment(comment);
+                            const subComments = comment.sub_comments || [];
+                            for (const subComment of subComments) addComment(subComment, comment.id);
+
+                            const expectedSubCount = Number(comment.sub_comment_count || comment.subCommentCount || 0);
+                            if (comment.id && expectedSubCount > subComments.length) {
+                                let subCursor = '';
+                                for (let subPage = 0; subPage < maxSubPages; subPage++) {
+                                    const subPath = '/api/sns/web/v2/comment/sub/page?note_id=' + encodeURIComponent(noteId)
+                                        + '&root_comment_id=' + encodeURIComponent(comment.id)
+                                        + '&cursor=' + encodeURIComponent(subCursor)
+                                        + '&num=10&image_formats=jpg,webp,avif';
+                                    const subResult = await signedFetch(subPath);
+                                    if (!subResult.ok) break;
+                                    const subData = (subResult.body && subResult.body.data) || {};
+                                    const pageSubs = subData.comments || subData.sub_comments || [];
+                                    for (const subComment of pageSubs) addComment(subComment, comment.id);
+                                    if (!subData.has_more) break;
+                                    const nextSubCursor = subData.cursor || subData.next_cursor || '';
+                                    if (!nextSubCursor || nextSubCursor === subCursor) break;
+                                    subCursor = nextSubCursor;
+                                }
+                            }
+                        }
+                        if (!data.has_more) break;
+                        const nextCursor = data.cursor || data.next_cursor || '';
+                        if (!nextCursor || nextCursor === cursor) break;
+                        cursor = nextCursor;
+                    }
+                    return {comments: all};
+                }""",
+                {"noteId": note_id, "maxPages": max_pages, "maxSubPages": max_sub_pages},
+            )
+        except Exception as exc:
+            logger.debug(f"XHS comment pagination {note_id} failed: {type(exc).__name__}: {exc}")
+            return []
+
+        extra_comments = []
+        for comment in (result or {}).get("comments", []):
+            cid = comment.get("id", "")
+            if cid and cid not in seen_comment_ids:
+                seen_comment_ids.add(cid)
+                extra_comments.append(comment)
+        if extra_comments:
+            logger.info(f"XHS {note_id} 游标补拉评论 {len(extra_comments)} 条")
+        return extra_comments
+
     async def _fetch_note_detail_and_comments(self, page, note_id: str) -> tuple[dict | None, list[dict], bool]:
         """访问笔记详情页，同时拦截笔记详情API和评论API
         
@@ -2382,6 +2581,10 @@ class XHSCrawler:
                 except Exception:
                     pass
 
+            extra_comments = await self._fetch_comment_pages_via_api(page, note_id, seen_comment_ids)
+            if extra_comments:
+                captured_comments.extend(extra_comments)
+
             return (detail_data if detail_data else None, captured_comments, feed_auth_failed)
         finally:
             page.remove_listener('response', on_response)
@@ -2450,6 +2653,66 @@ class XHSCrawler:
                 await p.stop()
             except Exception:
                 pass
+
+    async def start_comment_crawl(
+        self,
+        note_id: str,
+        login_account_id: int | None = None,
+        *,
+        allow_degraded_login: bool = False,
+    ) -> str:
+        if self._comment_status.get("running"):
+            raise RuntimeError("已有小红书评论抓取任务正在运行，请等待完成后再启动")
+
+        task_id = uuid.uuid4().hex[:8]
+        self._comment_status = {
+            "running": True,
+            "task_id": task_id,
+            "progress": f"正在抓取笔记 {note_id} 评论",
+            "error": None,
+            "note_id": note_id,
+            "saved": 0,
+        }
+        self._active_comment_task = asyncio.create_task(
+            self._run_comment_crawl_locked(
+                note_id,
+                task_id,
+                login_account_id=login_account_id,
+                allow_degraded_login=allow_degraded_login,
+            )
+        )
+        return task_id
+
+    async def _run_comment_crawl_locked(
+        self,
+        note_id: str,
+        task_id: str,
+        *,
+        login_account_id: int | None = None,
+        allow_degraded_login: bool = False,
+    ):
+        async with self._comment_lock:
+            try:
+                count = await self.crawl_single_note_comments(
+                    note_id,
+                    login_account_id=login_account_id,
+                    allow_degraded_login=allow_degraded_login,
+                )
+                self._comment_status.update({
+                    "running": False,
+                    "progress": f"笔记 {note_id} 评论抓取完成，保存 {count} 条",
+                    "saved": count,
+                })
+            except Exception as exc:
+                logger.error(f"XHS 评论抓取任务失败 {note_id}: {type(exc).__name__}: {exc}", exc_info=True)
+                self._comment_status.update({
+                    "running": False,
+                    "error": str(exc),
+                    "progress": "评论抓取失败",
+                })
+            finally:
+                if self._comment_status.get("task_id") == task_id:
+                    self._active_comment_task = None
 
     async def _crawl_comments_for_notes(self, page, uid: str, notes: list[dict]):
         """为已爬取的笔记抓取评论（导航到笔记页面，拦截评论API）"""
@@ -2572,17 +2835,20 @@ class XHSCrawler:
 
             # comment_id -> db id 映射（用于关联回复）
             cid_to_dbid = {}
+            existing_by_cid = {}
             existing_comments = await db.execute(
                 select(XHSComment).where(XHSComment.note_id == note.id)
             )
             for ec in existing_comments.scalars().all():
                 if ec.comment_id:
                     cid_to_dbid[ec.comment_id] = ec.id
+                    existing_by_cid[ec.comment_id] = ec
 
             new_count = 0
+            updated_count = 0
             for c in comments:
                 cid = c.get("id", "")
-                if not cid or cid in existing_ids:
+                if not cid:
                     continue
 
                 user_info = c.get("user_info") or c.get("userInfo") or {}
@@ -2590,10 +2856,7 @@ class XHSCrawler:
                 author_nickname = user_info.get("nickname", "") or user_info.get("nickName", "")
                 author_avatar_url = user_info.get("image", "") or user_info.get("avatar", "")
 
-                # 下载评论者头像
                 avatar_path = None
-                if author_avatar_url:
-                    avatar_path = await media_service.download_image(author_avatar_url, "avatar")
 
                 # 解析时间
                 comment_time = None
@@ -2636,6 +2899,50 @@ class XHSCrawler:
                 show_tags = c.get("show_tags") or []
                 is_author_flag = 1 if "is_author" in show_tags else 0
 
+                existing_comment = existing_by_cid.get(cid)
+                if existing_comment:
+                    changed = False
+                    if author_uid and author_uid != (existing_comment.author_uid or ""):
+                        existing_comment.author_uid = author_uid
+                        changed = True
+                    if author_nickname and author_nickname != (existing_comment.author_nickname or ""):
+                        existing_comment.author_nickname = author_nickname
+                        changed = True
+                    if author_avatar_url and not existing_comment.author_avatar:
+                        avatar_path = await media_service.download_image(author_avatar_url, "avatar")
+                        if avatar_path:
+                            existing_comment.author_avatar = avatar_path
+                            changed = True
+                    new_content = c.get("content", "")
+                    if new_content and new_content != (existing_comment.content or ""):
+                        existing_comment.content = new_content
+                        changed = True
+                    if like_count != (existing_comment.like_count or 0):
+                        existing_comment.like_count = like_count
+                        changed = True
+                    if comment_time and comment_time != existing_comment.comment_time:
+                        existing_comment.comment_time = comment_time
+                        changed = True
+                    if target_nickname and target_nickname != (existing_comment.target_nickname or ""):
+                        existing_comment.target_nickname = target_nickname
+                        changed = True
+                    if sub_comment_count != (existing_comment.sub_comment_count or 0):
+                        existing_comment.sub_comment_count = sub_comment_count
+                        changed = True
+                    if comment_ip and comment_ip != (existing_comment.ip_location or ""):
+                        existing_comment.ip_location = comment_ip
+                        changed = True
+                    if is_author_flag != (existing_comment.is_author or 0):
+                        existing_comment.is_author = is_author_flag
+                        changed = True
+                    if changed:
+                        updated_count += 1
+                    continue
+
+                # 新评论才下载头像，避免每次更新都重复请求媒体资源
+                if author_avatar_url:
+                    avatar_path = await media_service.download_image(author_avatar_url, "avatar")
+
                 comment = XHSComment(
                     note_id=note.id,
                     comment_id=cid,
@@ -2662,6 +2969,8 @@ class XHSCrawler:
             await db.commit()
             if new_count:
                 logger.info(f"XHS 笔记 {note_id_str} 新增 {new_count} 条评论")
+            if updated_count:
+                logger.info(f"XHS 笔记 {note_id_str} 更新 {updated_count} 条评论")
 
     async def reset_browser_data(self) -> dict:
         """手动重置浏览器指纹和cookie，清除被风控标记的数据"""
@@ -3489,7 +3798,7 @@ class XHSCrawler:
                                 const redIdEl = document.querySelector('.user-redId, [class*="user-redId"]');
                                 if (redIdEl) {
                                     const text = redIdEl.textContent || '';
-                                    const m = text.match(/[：:]\s*(\S+)/);
+                                    const m = text.match(/[：:]\\s*(\\S+)/);
                                     if (m) info.red_id = m[1];
                                 }
                                 // 昵称: <div class="user-name">天下第一伤心男子</div>

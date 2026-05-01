@@ -136,20 +136,6 @@
             </div>
 
             <div class="workspace-copy-side">
-              <div class="workspace-status-panel">
-                <span class="workspace-status-label">系统信号</span>
-                <div class="workspace-status-grid">
-                  <div class="workspace-status-pill" :class="napcatConnected ? 'online' : 'offline'">
-                    <span class="workspace-status-dot" :class="napcatConnected ? 'online' : 'offline'"></span>
-                    <span>NapCat {{ napcatConnected ? '在线' : '待接入' }}</span>
-                  </div>
-                  <div class="workspace-status-pill" :class="wsStatus === 'connected' ? 'online' : wsStatus === 'connecting' ? 'pending' : 'offline'">
-                    <span class="workspace-status-dot" :class="wsStatus === 'connected' ? 'online' : wsStatus === 'connecting' ? 'pending' : 'offline'"></span>
-                    <span>WS {{ wsStatusText }}</span>
-                  </div>
-                </div>
-              </div>
-
               <div class="highlight-ribbon">
                 <span v-for="highlight in currentModule.highlights" :key="highlight" class="highlight-pill">
                   {{ highlight }}
