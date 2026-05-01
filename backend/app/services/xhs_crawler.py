@@ -159,6 +159,32 @@ class XHSCrawler:
                 return 0
         return 0
 
+    def _is_local_static_file_missing(self, local_path: str | None) -> bool:
+        if not local_path:
+            return True
+        if not local_path.startswith("/static/"):
+            return False
+        file_path = os.path.join(settings.static_dir, local_path[len("/static/"):])
+        return not os.path.isfile(file_path)
+
+    @staticmethod
+    def _clean_ip_location(value: str | None) -> str:
+        text = (value or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"^IP属地[：:]\s*", "", text).strip()
+        invalid_keywords = (
+            "回到顶部", "返回顶部", "顶部", "展开", "收起", "评论", "点赞",
+            "分享", "收藏", "关注", "登录", "扫码", "发布", "笔记",
+        )
+        if any(keyword in text for keyword in invalid_keywords):
+            return ""
+        if len(text) > 12 or any(ch.isspace() for ch in text):
+            return ""
+        if re.search(r"[<>{}\[\]()/\\]", text):
+            return ""
+        return text
+
     async def navigate_to(self, url: str) -> dict:
         """在当前浏览器页面中导航到指定URL"""
         def is_allowed_navigation_url(candidate_url: str) -> bool:
@@ -228,10 +254,11 @@ class XHSCrawler:
                             });
                             if (!resp.ok) return {error: 'HTTP ' + resp.status};
                             const json = await resp.json();
-                            if (json.code === 0 && json.data) {
+                            if (json.code === 0 && json.data && json.data.guest !== true) {
                                 return { ok: true, red_id: json.data.red_id || '', user_id: json.data.user_id || '',
                                          nickname: json.data.nickname || '', imageb: json.data.imageb || '', images: json.data.images || '' };
                             }
+                            if (json.code === 0 && json.data && json.data.guest === true) return {error: 'guest=true'};
                             return {error: 'code=' + json.code};
                         } catch(e) { return {error: e.message}; }
                     }""")
@@ -242,6 +269,19 @@ class XHSCrawler:
                         my_avatar_url = me_result.get("imageb") or me_result.get("images") or ""
                 except Exception as e:
                     logger.debug(f"手动保存Cookie时获取用户信息失败: {e}")
+
+            if not (xhs_user_id or login_red_id):
+                detail = "未能验证小红书登录身份，请确认手机端已完成扫码确认后再保存 Cookie"
+                if page:
+                    try:
+                        page_title = await page.title()
+                        page_url = page.url
+                        detail = f"{detail}（当前页面: {page_title or page_url}）"
+                    except Exception:
+                        pass
+                self.login_status = "error"
+                self.login_status_detail = detail
+                return {"ok": False, "error": detail, "has_login_cookie": has_login}
 
             # 下载头像
             login_avatar_local = None
@@ -1600,8 +1640,10 @@ class XHSCrawler:
                         nt = note_card.get("type", "") or note.get("type", "")
                         if nt:
                             existing_note.note_type = nt
-                    if not existing_note.ip_location:
-                        ip_loc = note_card.get("ip_location", "") or note_card.get("ipLocation", "") or note.get("ip_location", "")
+                    if not self._clean_ip_location(existing_note.ip_location):
+                        ip_loc = self._clean_ip_location(
+                            note_card.get("ip_location", "") or note_card.get("ipLocation", "") or note.get("ip_location", "")
+                        )
                         if ip_loc:
                             existing_note.ip_location = ip_loc
                     if not existing_note.at_user_list:
@@ -1713,7 +1755,9 @@ class XHSCrawler:
                     post_time=new_time or datetime.now(),
                     last_update_time=last_update,
                     note_url=f"https://www.xiaohongshu.com/explore/{note_id}",
-                    ip_location=note_card.get("ip_location", "") or note_card.get("ipLocation", "") or note.get("ip_location", "") or "",
+                    ip_location=self._clean_ip_location(
+                        note_card.get("ip_location", "") or note_card.get("ipLocation", "") or note.get("ip_location", "")
+                    ),
                     location=note_card.get("location", "") or note.get("location", "") or "",  # location是用户设置的地理位置，不是IP属地
                     raw_data=note,
                 )
@@ -1856,11 +1900,14 @@ class XHSCrawler:
                                 updated = True
                                 logger.info(f"XHS {note_id} 更新原图 {len(downloaded)} 张")
 
-                    # 更新视频（覆盖模式下总是重新下载）
+                    # 更新/修复视频（覆盖模式或本地文件丢失时重新下载）
                     overwrite = getattr(self, '_crawl_mode', 'incremental') == 'overwrite'
                     if detail and detail.get("video_url"):
                         video_url = detail["video_url"]
-                        if video_url and (not db_note.local_video_path or overwrite):
+                        if video_url and (self._is_local_static_file_missing(db_note.local_video_path) or overwrite):
+                            if db_note.local_video_path and self._is_local_static_file_missing(db_note.local_video_path):
+                                logger.warning(f"XHS {note_id} 本地视频缺失，尝试重新下载")
+                                db_note.local_video_path = ""
                             db_note.video_url = video_url
                             local_video = await media_service.download_video(video_url, "xhs")
                             if local_video:
@@ -1897,8 +1944,9 @@ class XHSCrawler:
                             updated = True
 
                         # IP属地
-                        if detail.get("ip_location") and not db_note.ip_location:
-                            db_note.ip_location = detail["ip_location"]
+                        clean_ip_location = self._clean_ip_location(detail.get("ip_location"))
+                        if clean_ip_location and not self._clean_ip_location(db_note.ip_location):
+                            db_note.ip_location = clean_ip_location
                             updated = True
                         # location是用户发布位置，不从ip_location填充
                         if detail.get("location") and not db_note.location:
@@ -2259,7 +2307,7 @@ class XHSCrawler:
                             detail_data["like_count"] = self._parse_count(note_card.get("liked_count", 0))
 
                         # ========== IP属地 ==========
-                        ip_loc = note_card.get("ip_location", "")
+                        ip_loc = self._clean_ip_location(note_card.get("ip_location", ""))
                         if ip_loc:
                             detail_data["ip_location"] = ip_loc
 
@@ -2455,11 +2503,14 @@ class XHSCrawler:
                                     if (t && /^[\\d.]+[万kK]?$/.test(t)) counts.push(t);
                                 }
                                 if (counts.length >= 1) info.interact_counts = counts;
-                                // IP属地
-                                const ipEl = document.querySelector('[class*="location"], [class*="ip"]');
-                                if (ipEl) {
-                                    const ipText = (ipEl.textContent || '').trim();
-                                    if (ipText && ipText.length < 20) info.ip_location = ipText.replace(/^IP属地[：:]\\s*/, '');
+                                // IP属地：只接受明确带“IP属地”的文本，避免抓到“回到顶部”等通用 location/ip 类名
+                                const candidates = Array.from(document.querySelectorAll('[class*="location"], [class*="ip"], span, div'));
+                                for (const el of candidates) {
+                                    const ipText = (el.textContent || '').trim();
+                                    if (/^IP属地[：:]\\s*\\S{1,12}$/.test(ipText)) {
+                                        info.ip_location = ipText.replace(/^IP属地[：:]\\s*/, '');
+                                        break;
+                                    }
                                 }
                                 // 笔记类型(检查是否有video标签)
                                 const hasVideo = !!document.querySelector('[class*="note-detail"] video, [class*="player"] video, video[src]');
@@ -2473,8 +2524,9 @@ class XHSCrawler:
                                     detail_data["content"] = dom_detail["content"]
                                 if dom_detail.get("images") and not detail_data.get("images"):
                                     detail_data["images"] = dom_detail["images"]
-                                if dom_detail.get("ip_location") and not detail_data.get("ip_location"):
-                                    detail_data["ip_location"] = dom_detail["ip_location"]
+                                dom_ip_location = self._clean_ip_location(dom_detail.get("ip_location"))
+                                if dom_ip_location and not detail_data.get("ip_location"):
+                                    detail_data["ip_location"] = dom_ip_location
                                 if dom_detail.get("note_type") and not detail_data.get("note_type"):
                                     detail_data["note_type"] = dom_detail["note_type"]
                                 dom_imgs = len(dom_detail.get("images", []))
@@ -2893,7 +2945,7 @@ class XHSCrawler:
                     pass
 
                 # IP属地
-                comment_ip = c.get("ip_location", "") or c.get("ipLocation", "")
+                comment_ip = self._clean_ip_location(c.get("ip_location", "") or c.get("ipLocation", ""))
 
                 # 是否作者
                 show_tags = c.get("show_tags") or []
@@ -3744,7 +3796,7 @@ class XHSCrawler:
                                 });
                                 if (!resp.ok) return {error: 'HTTP ' + resp.status};
                                 const json = await resp.json();
-                                if (json.code === 0 && json.data) {
+                                if (json.code === 0 && json.data && json.data.guest !== true) {
                                     return {
                                         ok: true,
                                         red_id: json.data.red_id || '',
@@ -3755,6 +3807,7 @@ class XHSCrawler:
                                         images: json.data.images || '',
                                     };
                                 }
+                                if (json.code === 0 && json.data && json.data.guest === true) return {error: 'guest=true'};
                                 return {error: 'code=' + json.code};
                             } catch(e) { return {error: e.message}; }
                         }""")
@@ -3881,6 +3934,16 @@ class XHSCrawler:
                 # 最终使用之前通过DOM获取的red_id作为兜底
                 if not login_red_id and red_id:
                     login_red_id = red_id
+
+                if not (xhs_user_id or login_red_id):
+                    detail = "检测到登录 Cookie 变化，但未能通过 /user/me 或个人主页验证登录身份；请确认手机端已完成扫码确认后重试"
+                    if isinstance(me_result, dict) and me_result.get("error"):
+                        detail = f"{detail}（{me_result.get('error')}）"
+                    self.login_status = "error"
+                    self.login_status_detail = detail
+                    logger.warning(f"XHS登录验证失败: {detail}")
+                    await self._update_login_debug_snapshot("登录身份验证失败")
+                    break
 
                 async with async_session() as db:
                     # 查找是否已存在相同platform_uid的账号

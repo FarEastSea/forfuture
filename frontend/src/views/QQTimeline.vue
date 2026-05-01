@@ -88,29 +88,33 @@
             </a-tooltip>
           </div>
 
-          <div class="post-images" v-if="post.images && post.images.length > 0">
+          <div class="post-images" v-if="getLocalImages(post.images).length > 0">
             <a-image-preview-group>
               <a-image
-                v-for="(img, idx) in post.images"
+                v-for="(img, idx) in getLocalImages(post.images)"
                 :key="idx"
                 :src="getImageSrc(img)"
-                :width="imgSize(post.images.length)"
+                :width="imgSize(getLocalImages(post.images).length)"
                 fit="cover"
                 class="post-image"
               />
             </a-image-preview-group>
           </div>
+          <p v-if="hasMissingImages(post.images)" class="media-missing-tip">部分图片未下载到本地，请重新抓取修复。</p>
 
-          <div class="post-video" v-if="post.local_video_path || post.video_url">
+          <div class="post-video" v-if="post.local_video_path">
             <video
               controls
               playsinline
               preload="none"
-              :poster="post.images && post.images.length > 0 ? getImageSrc(post.images[0]) : undefined"
+              :poster="getLocalImages(post.images).length > 0 ? getImageSrc(getLocalImages(post.images)[0]) : undefined"
               :src="getVideoSrc(post)"
               class="post-video-player"
+              @error="onVideoError(post)"
             ></video>
+            <p v-if="post.video_error" class="video-error-tip">{{ post.video_error }}</p>
           </div>
+          <p v-else-if="post.video_url" class="media-missing-tip">视频未下载到本地，请重新登录后重新抓取修复。</p>
 
           <div class="post-forward" v-if="post.forward_content">
             <div class="forward-tag">转发</div>
@@ -277,33 +281,35 @@ function formatTime(t: string | null) {
 }
 
 function getImageSrc(img: any): string {
-  // 优先使用本地路径（已下载到服务器的图片）
   if (typeof img === 'string') {
-    if (img.startsWith('/static/') || img.startsWith('/api/')) return img
-    if (img.startsWith('http')) return `/api/proxy/image?url=${encodeURIComponent(img)}`
-    return img
+    if (img.startsWith('/static/')) return img
+    return ''
   }
-  if (img.local_path) return img.local_path
-  // 如果无本地路径，用代理URL避免CORS问题
-  if (img.url) return `/api/proxy/image?url=${encodeURIComponent(img.url)}`
+  if (img.local_path && img.local_path.startsWith('/static/')) return img.local_path
   return ''
+}
+
+function getLocalImages(images: any[] = []) {
+  return images.filter((img: any) => Boolean(getImageSrc(img)))
+}
+
+function hasMissingImages(images: any[] = []) {
+  return images.some((img: any) => !getImageSrc(img))
 }
 
 function onAvatarError(event: Event, post: any) {
-  // avatar加载失败时回退到q.qlogo.cn CDN
   const target = event.target as HTMLImageElement
-  if (!target || target.dataset.fallback === '1') return
-  target.dataset.fallback = '1'
-  const qq = post.author_qq || post.qq_number || ''
-  if (qq) {
-    target.src = `/api/proxy/image?url=${encodeURIComponent(`https://q.qlogo.cn/headimg_dl?dst_uin=${qq}&spec=640&img_type=jpg`)}`
-  }
+  if (target) target.style.display = 'none'
+  post.author_avatar = ''
 }
 
 function getVideoSrc(post: any): string {
-  if (post.local_video_path) return post.local_video_path
-  if (post.video_url) return `/api/proxy/image?url=${encodeURIComponent(post.video_url)}`
+  if (post.local_video_path && post.local_video_path.startsWith('/static/')) return post.local_video_path
   return ''
+}
+
+function onVideoError(post: any) {
+  post.video_error = '视频文件缺失或源地址已失效，请重新登录后重新抓取修复。'
 }
 
 function imgSize(count: number) {

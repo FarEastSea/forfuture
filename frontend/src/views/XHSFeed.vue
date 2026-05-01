@@ -52,6 +52,7 @@
             <img v-if="getCover(note)" :src="getCover(note)" alt="" />
             <div v-else class="cover-placeholder"><icon-image :size="32" /></div>
             <div class="note-type-badge" v-if="note.video_url || note.note_type === 'video'">视频</div>
+            <div class="note-type-badge missing" v-if="hasMissingXhsImages(note.images)">待修复媒体</div>
           </div>
           <div class="note-info">
             <div class="note-title">{{ note.title || '无标题' }}</div>
@@ -90,18 +91,22 @@
             <div class="post-time">{{ formatTime(detailNote.post_time) }}</div>
           </div>
         </div>
-        <div class="detail-images" v-if="detailNote.images && detailNote.images.length">
+        <div class="detail-images" v-if="getLocalXhsImages(detailNote.images).length">
           <a-image-preview-group>
-            <a-image v-for="(img, i) in detailNote.images" :key="i" :src="getXhsImageSrc(img)" width="100%" fit="contain" />
+            <a-image v-for="(img, i) in getLocalXhsImages(detailNote.images)" :key="i" :src="getXhsImageSrc(img)" width="100%" fit="contain" />
           </a-image-preview-group>
         </div>
-        <div class="detail-video" v-if="detailNote.local_video_path || detailNote.video_url">
+        <p v-if="hasMissingXhsImages(detailNote.images)" class="media-missing-tip">部分图片未下载到本地，请重新抓取修复。</p>
+        <div class="detail-video" v-if="detailNote.local_video_path">
           <video
             controls
             :src="getXhsVideoSrc(detailNote)"
             style="width: 100%; max-height: 400px; border-radius: 8px; background: #000"
+            @error="onXhsVideoError(detailNote)"
           ></video>
         </div>
+        <p v-if="detailNote.video_error" class="media-missing-tip">{{ detailNote.video_error }}</p>
+        <p v-else-if="detailNote.video_url" class="media-missing-tip">视频未下载到本地，请重新登录后重新抓取修复。</p>
         <div class="detail-content">{{ detailNote.content }}</div>
         <div class="detail-meta-row" v-if="detailNote.device_info || detailNote.location || detailNote.ip_location || detailNote.note_type || detailNote.video_duration">
           <a-tag v-if="detailNote.note_type" size="small" :color="detailNote.note_type === 'video' ? 'purple' : 'blue'">{{ detailNote.note_type === 'video' ? '视频笔记' : '图文笔记' }}</a-tag>
@@ -344,10 +349,8 @@ function getErrorMessage(error: unknown, fallback: string) {
 }
 
 function getCover(note: any): string {
-  if (note.images && note.images.length > 0) {
-    return getXhsImageSrc(note.images[0])
-  }
-  return ''
+  const localImages = getLocalXhsImages(note.images || [])
+  return localImages.length > 0 ? getXhsImageSrc(localImages[0]) : ''
 }
 
 function normalizeRemoteMediaUrl(url: string): string {
@@ -370,20 +373,29 @@ function getAvatarSrc(url: string): string {
 function getXhsImageSrc(img: any): string {
   if (typeof img === 'string') {
     img = normalizeRemoteMediaUrl(img)
-    if (img.startsWith('/static/') || img.startsWith('/api/')) return img
-    if (img.startsWith('http')) return buildProxyMediaUrl(img)
-    return img
+    if (img.startsWith('/static/')) return img
+    return ''
   }
-  if (img.local_path) return img.local_path
-  if (img.url) return buildProxyMediaUrl(img.url)
+  if (img.local_path && img.local_path.startsWith('/static/')) return img.local_path
   return ''
+}
+
+function getLocalXhsImages(images: any[] = []) {
+  return images.filter((img: any) => Boolean(getXhsImageSrc(img)))
+}
+
+function hasMissingXhsImages(images: any[] = []) {
+  return images.some((img: any) => !getXhsImageSrc(img))
 }
 
 function getXhsVideoSrc(note: any): string {
   if (!note) return ''
-  if (note.local_video_path) return note.local_video_path
-  if (note.video_url) return buildProxyMediaUrl(note.video_url)
+  if (note.local_video_path && note.local_video_path.startsWith('/static/')) return note.local_video_path
   return ''
+}
+
+function onXhsVideoError(note: any) {
+  note.video_error = '视频文件缺失或无法加载，请重新登录后重新抓取修复。'
 }
 
 function formatTime(t: string | null) {

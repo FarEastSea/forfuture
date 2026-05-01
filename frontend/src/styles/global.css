@@ -1150,6 +1150,13 @@ body::-webkit-scrollbar-thumb:hover,
   object-fit: contain;
 }
 
+.video-error-tip,
+.media-missing-tip {
+  margin-top: 8px;
+  color: var(--danger);
+  font-size: 12px;
+}
+
 .post-forward {
   background: var(--bg-hover); border-radius: var(--radius);
   padding: 12px; margin-bottom: 12px;
@@ -1221,6 +1228,10 @@ body::-webkit-scrollbar-thumb:hover,
   position: absolute; top: 8px; right: 8px;
   background: rgba(0,0,0,0.6); color: #fff; font-size: 11px;
   padding: 2px 8px; border-radius: 10px;
+}
+.note-type-badge.missing {
+  top: 34px;
+  background: rgba(241, 124, 105, 0.86);
 }
 
 .note-info {
@@ -1855,7 +1866,15 @@ body::-webkit-scrollbar-thumb:hover,
   line-height: 24px !important;
   font-size: 12px !important;
 }
-.preview-header .arco-switch { min-width: 110px !important; height: 24px !important; font-size: 12px !important; }
+.preview-switch-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.preview-switch-label { line-height: 24px; }
 .settings-page .arco-form-item-extra,
 .settings-page .arco-form-item-message { font-size: 13px !important; }
 

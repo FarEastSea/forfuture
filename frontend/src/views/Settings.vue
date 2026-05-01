@@ -392,10 +392,12 @@
               </div>
               <a-space size="small">
                 <a-tooltip content="开启后登录成功不会立即关闭浏览器，可继续在预览中浏览和操作">
-                  <a-switch v-model="keepPreviewAfterLogin" size="small">
-                    <template #checked><icon-eye /> 保持预览</template>
-                    <template #unchecked>登录后关闭</template>
-                  </a-switch>
+                  <span class="preview-switch-control">
+                    <a-switch v-model="keepPreviewAfterLogin" size="small" />
+                    <span class="preview-switch-label">
+                      {{ keepPreviewAfterLogin ? '登录后保持预览' : '登录后关闭' }}
+                    </span>
+                  </span>
                 </a-tooltip>
                 <a-button v-if="!browserPreviewConnected && qrcodeLoginType" size="mini" type="primary" @click="startBrowserPreview(qrcodeLoginType)">
                   连接预览
@@ -1810,6 +1812,7 @@ async function loginXHS() {
           loginStatusColor.value = 'var(--color-danger-6)'
           cleanupLoginPoll()
           xhsLogging.value = false
+          Message.error(status.detail || '小红书登录失败')
           // 如果是"登录异常"自动重置，提示用户重新获取二维码
           if (status.detail && status.detail.includes('自动重置')) {
             Message.warning('浏览器数据已自动重置，请重新点击登录获取二维码')
@@ -1818,10 +1821,20 @@ async function loginXHS() {
           loginStatusText.value = status.detail || '等待扫码...'
           loginStatusColor.value = ''
         }
-      } catch (e) { console.error('XHS状态轮询异常', e) }
+      } catch (e: any) {
+        const message = getErrorMessage(e, '小红书登录状态检查失败')
+        loginStatusText.value = message
+        loginStatusColor.value = 'var(--color-danger-6)'
+        cleanupLoginPoll()
+        xhsLogging.value = false
+        Message.error(message)
+      }
     }, 3000)
     setTimeout(() => { cleanupLoginPoll(); xhsLogging.value = false }, 200000)
-  } catch { xhsLogging.value = false; Message.error('获取二维码失败') }
+  } catch (e: any) {
+    xhsLogging.value = false
+    Message.error(e?.response?.data?.detail || '获取二维码失败')
+  }
 }
 
 async function refreshQQCookies() {

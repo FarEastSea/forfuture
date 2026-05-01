@@ -1640,6 +1640,14 @@ class QQCrawler:
         )
         return hashlib.sha1(raw_fingerprint.encode("utf-8")).hexdigest()[:16]
 
+    def _is_local_static_file_missing(self, local_path: str | None) -> bool:
+        if not local_path:
+            return True
+        if not local_path.startswith("/static/"):
+            return False
+        file_path = os.path.join(settings.static_dir, local_path[len("/static/"):])
+        return not os.path.isfile(file_path)
+
     async def _save_qq_comments(self, db, post, comments: list[dict]) -> int:
         if not comments:
             return 0
@@ -2014,8 +2022,11 @@ class QQCrawler:
                                         existing_post.content = new_content
                                         self._log(f"QQ说说 {post_id} 内容已更新")
 
-                                    # 补充视频（如果之前没有）
-                                    if not existing_post.local_video_path:
+                                    # 补充或修复视频（本地文件丢失时用本轮API里的新URL重新下载）
+                                    if self._is_local_static_file_missing(existing_post.local_video_path):
+                                        if existing_post.local_video_path:
+                                            self._log(f"QQ说说 {post_id} 本地视频缺失，尝试重新下载", "warning")
+                                            existing_post.local_video_path = ""
                                         video_list = msg.get("video", [])
                                         if video_list and isinstance(video_list, list):
                                             for vid in video_list:
@@ -2025,7 +2036,7 @@ class QQCrawler:
                                                     local_video = await media_service.download_video(vid_url, "qq")
                                                     if local_video:
                                                         existing_post.local_video_path = local_video
-                                                        self._log(f"补充视频: {post_id}")
+                                                        self._log(f"补充/修复视频: {post_id}")
                                                     break
 
                                     # 增量更新评论

@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, func
 from typing import Optional
 import os
+import re
 from app.database import get_db
 from app.config import settings
 from app.models.xhs_post import XHSNote, XHSComment
@@ -10,6 +11,21 @@ from app.schemas import XHSCrawlRequest
 from app.security import require_admin_http
 
 router = APIRouter(dependencies=[Depends(require_admin_http)])
+
+
+def _sanitize_ip_location(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"^IP属地[：:]\s*", "", text).strip()
+    invalid_keywords = ("回到顶部", "返回顶部", "顶部", "展开", "收起", "评论", "点赞", "分享", "收藏", "关注", "登录")
+    if any(keyword in text for keyword in invalid_keywords):
+        return ""
+    if len(text) > 12 or any(ch.isspace() for ch in text):
+        return ""
+    if re.search(r"[<>{}\[\]()/\\]", text):
+        return ""
+    return text
 
 
 def _sanitize_avatar(avatar: str | None) -> str:
@@ -116,7 +132,7 @@ async def get_xhs_notes(
             "collect_count": note.collect_count,
             "comment_count": note.comment_count,
             "share_count": note.share_count,
-            "ip_location": note.ip_location,
+            "ip_location": _sanitize_ip_location(note.ip_location),
             "device_info": note.device_info,
             "location": note.location,
             "edit_history": note.edit_history or [],
@@ -198,7 +214,7 @@ async def get_xhs_note_detail(note_db_id: int, db: AsyncSession = Depends(get_db
         "collect_count": note.collect_count,
         "comment_count": note.comment_count,
         "share_count": note.share_count,
-        "ip_location": note.ip_location,
+        "ip_location": _sanitize_ip_location(note.ip_location),
         "device_info": note.device_info,
         "location": note.location,
         "edit_history": note.edit_history or [],

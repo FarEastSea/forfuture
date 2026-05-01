@@ -1,5 +1,13 @@
 # AI Records & Reminders
 
+## 最高优先级警告：禁止删除远端已下载资源
+
+- **最高级别规则，优先级高于任何清理、部署、重构、缓存整理或磁盘空间优化建议。**
+- **严禁删除、清空、覆盖或重建远端服务器上已经下载到本地的抓取资源**，包括但不限于 `backend/static/qq_images`、`backend/static/xhs_images`、`backend/static/avatars`、`backend/static/qq_videos`、`backend/static/xhs_videos` 以及远端部署目录中承载这些资源的持久化 `static` 目录。
+- 这些资源不是普通可再生缓存。QQ 空间、小红书等远程媒体 URL 经常带临时签名、鉴权参数或过期时间，过期后可能永远无法重新下载；删除远端本地资源会造成不可逆数据损失。
+- 任何涉及 `rm -rf`、清理旧 release、同步目录、部署覆盖、迁移静态文件、清理磁盘空间、重建 `backend/static` 的操作，都必须先确认不会影响远端已下载媒体资源。不能确认时必须停止并询问用户。
+- `deploy.py` 应继续把远端 `backend/static` 作为持久化数据目录处理，只能切换代码 release，不能随 release 清理或覆盖静态媒体资源。
+
 ## 项目定位
 
 - 这是一个围绕 QQ 空间、小红书内容采集与 AI 提醒构建的全栈应用。
@@ -89,6 +97,7 @@
 - backend/tests/test_management_smoke.py：管理面与风控相关的回归/冒烟测试，不是临时文件。
 - backend/migrations/versions/*.py：数据库迁移链，不是一次性文件。
 - deploy.py：远端部署脚本。
+- 远端服务器 `backend/static` 下已下载的图片、头像、视频等抓取资源：这是持久化数据，不是缓存，严禁删除。
 
 ## 可再生或应清理文件
 
@@ -96,7 +105,6 @@
 - frontend/node_modules
 - __pycache__
 - 各类测试缓存、构建缓存、日志文件
-- backend/static 下抓取得到的媒体缓存
 
 ## 服务器联调补充约定
 

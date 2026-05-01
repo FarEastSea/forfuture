@@ -13,7 +13,7 @@ router = APIRouter(dependencies=[Depends(require_admin_http)])
 
 
 def _check_images(images: list) -> list:
-    """校验图片的local_path是否真实存在，不存在则清空让前端走代理"""
+    """校验图片的 local_path 是否真实存在，不存在则清空并由前端提示重新抓取。"""
     if not images:
         return images
     checked = []
@@ -30,16 +30,22 @@ def _check_images(images: list) -> list:
 
 
 def _check_avatar(avatar: str | None, qq_number: str = "") -> str:
-    """校验头像文件是否存在，不存在则返回QQ CDN URL"""
-    cdn_fallback = ""
-    if qq_number:
-        cdn_fallback = f"https://q.qlogo.cn/headimg_dl?dst_uin={qq_number}&spec=640&img_type=jpg"
+    """校验头像文件是否存在；已抓取内容不再回退远程头像。"""
     if not avatar or not avatar.startswith("/static/"):
-        return avatar or cdn_fallback
+        return ""
     file_path = os.path.join(settings.static_dir, avatar[len("/static/"):])
     if os.path.isfile(file_path):
         return avatar
-    return cdn_fallback
+    return ""
+
+
+def _check_local_video_path(local_video_path: str | None) -> str | None:
+    """校验本地视频是否仍存在；不存在时清空并由前端提示重新抓取。"""
+    if not local_video_path or not local_video_path.startswith("/static/"):
+        return local_video_path
+
+    file_path = os.path.join(settings.static_dir, local_video_path[len("/static/"):])
+    return local_video_path if os.path.isfile(file_path) else None
 
 
 @router.get("/posts")
@@ -72,7 +78,7 @@ async def get_qq_posts(
             "content": post.content,
             "images": _check_images(post.images or []),
             "video_url": post.video_url,
-            "local_video_path": post.local_video_path,
+            "local_video_path": _check_local_video_path(post.local_video_path),
             "post_time": post.post_time.isoformat() if post.post_time else None,
             "like_count": post.like_count,
             "comment_count": post.comment_count,
@@ -126,7 +132,7 @@ async def get_qq_post_detail(post_id: int, db: AsyncSession = Depends(get_db)):
         "content": post.content,
         "images": _check_images(post.images or []),
         "video_url": post.video_url,
-        "local_video_path": post.local_video_path,
+        "local_video_path": _check_local_video_path(post.local_video_path),
         "post_time": post.post_time.isoformat() if post.post_time else None,
         "like_count": post.like_count,
         "comment_count": post.comment_count,
