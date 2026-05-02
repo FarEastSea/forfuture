@@ -22,6 +22,8 @@ class XHSCrawler:
         self._comment_lock = asyncio.Lock()
         self._active_task: asyncio.Task | None = None
         self._active_comment_task: asyncio.Task | None = None
+        self._crawl_detail_delay_seconds = self._get_float_env("XHS_CRAWL_DETAIL_DELAY_SECONDS", 5.0, minimum=3.0)
+        self._profile_scroll_delay_seconds = self._get_float_env("XHS_PROFILE_SCROLL_DELAY_SECONDS", 3.0, minimum=2.0)
         self.login_status = "unknown"
         self.login_status_detail = ""
         self._browser_context = None
@@ -36,6 +38,155 @@ class XHSCrawler:
             "screenshot": "",
             "events": [],
         }
+
+    @staticmethod
+    def _get_float_env(name: str, default: float, *, minimum: float) -> float:
+        try:
+            value = float(os.getenv(name, str(default)))
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, value)
+
+    async def _load_crawl_timing_config(self):
+        from app.database import async_session
+        from app.models.system_config import SystemConfig
+        from sqlalchemy import select
+
+        defaults = {
+            "xhs_crawl_detail_delay_seconds": self._get_float_env("XHS_CRAWL_DETAIL_DELAY_SECONDS", 5.0, minimum=3.0),
+            "xhs_profile_scroll_delay_seconds": self._get_float_env("XHS_PROFILE_SCROLL_DELAY_SECONDS", 3.0, minimum=2.0),
+        }
+        try:
+            async with async_session() as db:
+                result = await db.execute(
+                    select(SystemConfig).where(SystemConfig.key.in_(defaults.keys()))
+                )
+                config_map = {item.key: item.value for item in result.scalars().all()}
+        except Exception as exc:
+            logger.debug(f"读取XHS抓取节奏配置失败，使用默认值: {exc}")
+            config_map = {}
+
+        def parse_seconds(key: str, minimum: float) -> float:
+            try:
+                return max(minimum, float(config_map.get(key) or defaults[key]))
+            except (TypeError, ValueError):
+                return defaults[key]
+
+        self._crawl_detail_delay_seconds = parse_seconds("xhs_crawl_detail_delay_seconds", 3.0)
+        self._profile_scroll_delay_seconds = parse_seconds("xhs_profile_scroll_delay_seconds", 2.0)
+
+    def _browser_data_dir(self) -> str:
+        return os.path.join(
+            os.path.dirname(os.path.abspath(settings.static_dir)),
+            "browser_data",
+            "xhs_login",
+        )
+
+    def _browser_launch_args(self) -> list[str]:
+        """Keep the browser profile close to a normal Chrome session."""
+        return [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--window-size=1280,800",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-blink-features=AutomationControlled",
+        ]
+
+    async def _capture_storage_state(self, context) -> dict:
+        try:
+            return await context.storage_state()
+        except Exception as exc:
+            logger.debug(f"XHS storage_state 捕获失败: {exc}")
+            return {}
+
+    async def _restore_storage_state(self, page, storage_state: dict | None):
+        if not storage_state:
+            return
+        origins = storage_state.get("origins") if isinstance(storage_state, dict) else None
+        if not origins:
+            return
+        for origin in origins:
+            origin_url = origin.get("origin", "")
+            local_storage = origin.get("localStorage") or []
+            if not origin_url.startswith(("https://www.xiaohongshu.com", "https://edith.xiaohongshu.com")):
+                continue
+            if not local_storage:
+                continue
+            try:
+                await page.goto(origin_url, wait_until="domcontentloaded", timeout=12000)
+                await page.evaluate(
+                    """(items) => {
+                        for (const item of items) {
+                            if (item && item.name) localStorage.setItem(item.name, item.value || '');
+                        }
+                    }""",
+                    local_storage,
+                )
+                logger.debug(f"XHS 已恢复 localStorage: {origin_url}, {len(local_storage)} 项")
+            except Exception as exc:
+                logger.debug(f"XHS localStorage 恢复失败 {origin_url}: {exc}")
+
+    def _load_saved_storage_state(self, account) -> dict:
+        if not account or not getattr(account, "token", None):
+            return {}
+        try:
+            token_data = json.loads(account.token)
+        except Exception:
+            return {}
+        if isinstance(token_data, dict):
+            state = token_data.get("storage_state")
+            return state if isinstance(state, dict) else {}
+        return {}
+
+    async def _get_current_identity(self, page) -> dict:
+        try:
+            result = await page.evaluate("""async () => {
+                try {
+                    const resp = await fetch('https://edith.xiaohongshu.com/api/sns/web/v2/user/me', {
+                        method: 'GET',
+                        credentials: 'include',
+                        headers: {
+                            'Accept': 'application/json, text/plain, */*',
+                            'Origin': 'https://www.xiaohongshu.com',
+                            'Referer': 'https://www.xiaohongshu.com/',
+                        }
+                    });
+                    if (!resp.ok) return {ok: false, error: 'HTTP ' + resp.status};
+                    const json = await resp.json();
+                    if (json.code === 0 && json.data && json.data.guest !== true) {
+                        return {
+                            ok: true,
+                            red_id: json.data.red_id || '',
+                            user_id: json.data.user_id || '',
+                            nickname: json.data.nickname || '',
+                            imageb: json.data.imageb || '',
+                            images: json.data.images || '',
+                        };
+                    }
+                    if (json.code === 0 && json.data && json.data.guest === true) return {ok: false, error: 'guest=true'};
+                    return {ok: false, error: 'code=' + json.code};
+                } catch(e) {
+                    return {ok: false, error: e.message};
+                }
+            }""")
+            return result if isinstance(result, dict) else {"ok": False, "error": "invalid_identity_result"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _identity_matches_account(self, identity: dict, account) -> bool:
+        if not identity.get("ok"):
+            return False
+        user_id = str(identity.get("user_id") or "").strip()
+        red_id = str(identity.get("red_id") or "").strip()
+        expected_uid = str(getattr(account, "platform_uid", "") or "").strip()
+        expected_red_id = str(getattr(account, "account_id", "") or "").strip()
+        if expected_uid and user_id and expected_uid == user_id:
+            return True
+        if expected_red_id and red_id and expected_red_id == red_id:
+            return True
+        return not expected_uid and not expected_red_id
 
     def get_status(self) -> dict:
         return self._status
@@ -297,6 +448,7 @@ class XHSCrawler:
             from app.models.account import Account
             from app.services.account_risk_service import mark_account_verified
             from sqlalchemy import select
+            storage_state = await self._capture_storage_state(context)
 
             async with async_session() as db:
                 # 查找已有的同UID账号
@@ -312,6 +464,8 @@ class XHSCrawler:
 
                 if existing_account:
                     existing_account.cookies = json.dumps(cookies)
+                    if storage_state:
+                        existing_account.token = json.dumps({"storage_state": storage_state}, ensure_ascii=False)
                     existing_account.last_login = datetime.now()
                     if login_red_id:
                         existing_account.account_id = login_red_id
@@ -330,6 +484,7 @@ class XHSCrawler:
                         nickname=nickname,
                         avatar_url=login_avatar_local or "",
                         cookies=json.dumps(cookies),
+                        token=json.dumps({"storage_state": storage_state}, ensure_ascii=False) if storage_state else None,
                         is_target=0,
                         last_login=datetime.now(),
                     )
@@ -520,6 +675,7 @@ class XHSCrawler:
 
         核心原理：导航到用户主页，XHS自身JS自动发出签名请求，我们拦截API响应获取数据。
         """
+        await self._load_crawl_timing_config()
         account = await self._load_login_account(
             login_account_id,
             require_cookies=True,
@@ -541,21 +697,23 @@ class XHSCrawler:
         except ImportError:
             return False
 
+        if self._browser_context:
+            self._status["error"] = "小红书登录/预览浏览器正在运行，请先完成登录或断开预览后再爬取"
+            logger.warning("XHS爬取跳过：登录/预览浏览器正在占用同一个持久化 profile")
+            return True
+
         p = None
         browser = None
         context = None
         try:
             p = await async_playwright().start()
             # 使用持久化浏览器上下文，保持设备指纹一致
-            browser_data_dir = os.path.join(
-                os.path.dirname(os.path.abspath(settings.static_dir)),
-                "browser_data", "xhs_crawl"
-            )
+            browser_data_dir = self._browser_data_dir()
             os.makedirs(browser_data_dir, exist_ok=True)
             context = await p.chromium.launch_persistent_context(
                 browser_data_dir,
                 headless=True,
-                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled', '--disable-infobars'],
+                args=self._browser_launch_args(),
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
                 viewport={"width": 1280, "height": 800},
                 locale="zh-CN",
@@ -592,10 +750,10 @@ class XHSCrawler:
                 if (window.outerHeight === 0) Object.defineProperty(window, 'outerHeight', { get: () => 885 });
                 delete Object.getPrototypeOf(navigator).webdriver;
             """)
-            # 清除旧cookie并注入新的登录cookie
-            await context.clear_cookies()
+            # 复用登录 profile，仅补充 DB 中保存的 cookie/storage_state，不清空 profile。
             await context.add_cookies(cookies)
             page = context.pages[0] if context.pages else await context.new_page()
+            await self._restore_storage_state(page, self._load_saved_storage_state(account))
 
             # 先访问小红书首页让JS加载
             try:
@@ -603,6 +761,15 @@ class XHSCrawler:
             except Exception:
                 pass
             await asyncio.sleep(2)
+
+            identity = await self._get_current_identity(page)
+            if not self._identity_matches_account(identity, account):
+                self._status["error"] = "小红书登录态与选中的登录账号不一致，请重新扫码登录后再爬取"
+                logger.warning(
+                    "XHS爬取中止：profile身份与登录账号不一致，"
+                    f"identity={identity}, account_id={account.account_id}, platform_uid={account.platform_uid}"
+                )
+                return True
 
             any_success = False
             for uid in user_ids:
@@ -1090,7 +1257,7 @@ class XHSCrawler:
                         text = (await tab.text_content() or "").strip()
                         if "笔记" in text:
                             await tab.click()
-                            await asyncio.sleep(3)
+                            await asyncio.sleep(self._profile_scroll_delay_seconds)
                             logger.info("XHS 点击了'笔记'标签")
                             break
                 except Exception:
@@ -1111,7 +1278,7 @@ class XHSCrawler:
             for scroll_i in range(max_scrolls):
                 prev_count = len(captured_notes)
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await asyncio.sleep(2)
+                await asyncio.sleep(self._profile_scroll_delay_seconds)
 
                 no_more = await page.evaluate("""() => {
                     const texts = document.body.innerText || '';
@@ -1130,7 +1297,7 @@ class XHSCrawler:
 
                 if len(captured_notes) == prev_count:
                     consecutive_no_new += 1
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(self._profile_scroll_delay_seconds)
                     if consecutive_no_new >= 4:
                         stop_reason = "consecutive_no_new"
                         logger.info(f"XHS 连续{consecutive_no_new}次滚动无新数据，停止")
@@ -2020,7 +2187,7 @@ class XHSCrawler:
                 # 只有成功获取到数据才计数
                 if detail and (detail.get("images") or detail.get("title") or detail.get("video_url")):
                     success_count += 1
-                await asyncio.sleep(3)  # 增大间隔减少风控风险
+                await asyncio.sleep(self._crawl_detail_delay_seconds)
             except Exception as e:
                 logger.error(f"XHS 获取笔记 {note_id} 详情失败: {type(e).__name__}: {e}")
             finally:
@@ -2030,7 +2197,7 @@ class XHSCrawler:
                     if "/user/profile/" not in cur:
                         # 页面被导航走了，必须回到个人主页
                         await page.goto(profile_url, wait_until="networkidle", timeout=15000)
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(self._profile_scroll_delay_seconds)
                     else:
                         # 仍在主页URL，但DOM可能被弹窗/导航破坏（React状态脏了）
                         # 按Escape关闭可能的弹窗
@@ -2666,7 +2833,7 @@ class XHSCrawler:
         p = await async_playwright().start()
         browser = None
         try:
-            browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'])
+            browser = await p.chromium.launch(headless=True, args=self._browser_launch_args())
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
                 extra_http_headers={
@@ -2682,6 +2849,7 @@ class XHSCrawler:
             """)
             await context.add_cookies(cookies)
             page = await context.new_page()
+            await self._restore_storage_state(page, self._load_saved_storage_state(account))
 
             # 先访问首页加载JS
             try:
@@ -3095,43 +3263,19 @@ class XHSCrawler:
         try:
             # 复用浏览器数据目录（维持设备指纹一致性，减少风控风险）
             # 如需重置，可通过前端"重置浏览器"按钮手动清理
-            browser_data_dir = os.path.join(
-                os.path.dirname(os.path.abspath(settings.static_dir)),
-                "browser_data", "xhs_login"
-            )
+            browser_data_dir = self._browser_data_dir()
             os.makedirs(browser_data_dir, exist_ok=True)
             logger.info(f"复用XHS浏览器数据目录: {browser_data_dir}")
 
             context = await p.chromium.launch_persistent_context(
                 browser_data_dir,
                 headless=True,
-                args=[
-                    '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-infobars',
-                    '--window-size=1280,800',
-                    '--disable-features=IsolateOrigins,site-per-process',
-                    '--disable-site-isolation-trials',
-                    '--disable-web-security',
-                    '--disable-features=CrossSiteDocumentBlockingIfIsolating',
-                    '--no-first-run',
-                    '--no-default-browser-check',
-                    '--disable-extensions',
-                    '--disable-component-extensions-with-background-pages',
-                    '--disable-default-apps',
-                    '--disable-hang-monitor',
-                    '--disable-prompt-on-repost',
-                    '--disable-background-timer-throttling',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                    '--enable-features=NetworkService,NetworkServiceInProcess',
-                ],
+                args=self._browser_launch_args(),
                 viewport={"width": 1280, "height": 800},
                 device_scale_factor=1,
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
                 locale="zh-CN",
                 timezone_id="Asia/Shanghai",
-                ignore_https_errors=True,
                 extra_http_headers={
                     'Sec-CH-UA': '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
                     'Sec-CH-UA-Mobile': '?0',
@@ -3151,9 +3295,6 @@ class XHSCrawler:
 
         try:
             page = context.pages[0] if context.pages else await context.new_page()
-
-            # 清除旧cookie确保干净的登录状态
-            await context.clear_cookies()
 
             # 注入全面的反检测脚本（隐藏Playwright/headless特征）
             await context.add_init_script("""
@@ -3406,6 +3547,21 @@ class XHSCrawler:
             except Exception:
                 logger.warning("小红书页面加载超时，尝试继续...")
             await asyncio.sleep(3)
+
+            existing_identity = await self._get_current_identity(page)
+            if existing_identity.get("ok"):
+                self._browser_context = {"context": context, "page": page, "playwright": p}
+                save_result = await self.save_cookies_manual()
+                if save_result.get("ok"):
+                    self.login_status = "logged_in"
+                    self.login_status_detail = "检测到已有小红书登录会话，Cookie已保存"
+                    await self._update_login_debug_snapshot("复用已有登录会话")
+                    try:
+                        shot = await page.screenshot(type="png", full_page=False, timeout=5000)
+                        return base64.b64encode(shot).decode()
+                    except Exception:
+                        return base64.b64encode(b"existing-xhs-session").decode()
+                logger.warning(f"检测到已有XHS会话但保存失败: {save_result}")
 
             # 尝试多种方式触发登录弹窗
             login_btn = page.locator('text=登录, text=Log in, .login-btn, [class*="login"]')
@@ -3773,6 +3929,7 @@ class XHSCrawler:
                 from app.models.account import Account
                 from app.services.media_service import media_service
                 from sqlalchemy import select
+                storage_state = await self._capture_storage_state(context)
 
                 login_avatar_local = None
                 login_red_id = ""
@@ -3964,6 +4121,8 @@ class XHSCrawler:
                         # 同一用户重新登录 → 更新
                         account = existing_account
                         account.cookies = json.dumps(cookies)
+                        if storage_state:
+                            account.token = json.dumps({"storage_state": storage_state}, ensure_ascii=False)
                         account.last_login = datetime.now()
                         if login_red_id:
                             account.account_id = login_red_id
@@ -3986,6 +4145,7 @@ class XHSCrawler:
                             nickname=nickname,
                             avatar_url=login_avatar_local or "",
                             cookies=json.dumps(cookies),
+                            token=json.dumps({"storage_state": storage_state}, ensure_ascii=False) if storage_state else None,
                             is_target=0,
                             last_login=datetime.now(),
                         )

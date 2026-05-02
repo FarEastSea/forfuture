@@ -738,6 +738,22 @@
 
         <div class="settings-card">
         <div class="settings-section">
+          <h3>小红书抓取节奏</h3>
+          <p class="section-desc">控制小红书列表滚动和详情页抓取之间的等待时间。数值越大越慢，但更接近人工浏览节奏。</p>
+          <a-form :model="{ xhsCrawlDetailDelaySeconds, xhsProfileScrollDelaySeconds }" layout="vertical" class="settings-form">
+            <a-form-item label="详情抓取间隔（秒）" help="每篇笔记详情、评论、媒体抓取后的等待时间；建议 5 秒以上。">
+              <a-input-number v-model="xhsCrawlDetailDelaySeconds" :min="3" :max="60" :step="1" size="large" />
+            </a-form-item>
+            <a-form-item label="主页滚动间隔（秒）" help="用户主页滚动加载下一批笔记后的等待时间；建议 3 秒以上。">
+              <a-input-number v-model="xhsProfileScrollDelaySeconds" :min="2" :max="30" :step="1" size="large" />
+            </a-form-item>
+            <a-button size="large" @click="saveXhsCrawlTimingConfig">保存小红书抓取节奏</a-button>
+          </a-form>
+        </div>
+        </div>
+
+        <div class="settings-card">
+        <div class="settings-section">
           <h3>登录风控</h3>
           <p class="section-desc">控制登录账号进入降级、冷却或待重新登录后的自动抓取策略。</p>
           <a-form :model="{ skipCrawlWhenLoginDegraded, cookieFailureThreshold, riskCooldownMinutes }" layout="vertical" class="settings-form">
@@ -971,6 +987,8 @@ const autoCrawlInterval = ref(60)
 const skipCrawlWhenLoginDegraded = ref(true)
 const cookieFailureThreshold = ref(2)
 const riskCooldownMinutes = ref(30)
+const xhsCrawlDetailDelaySeconds = ref(5)
+const xhsProfileScrollDelaySeconds = ref(3)
 
 // AI上下文模式
 const aiContextMode = ref('full')
@@ -1370,6 +1388,27 @@ async function saveRiskControlConfig() {
   }
 }
 
+async function saveXhsCrawlTimingConfig() {
+  if (xhsCrawlDetailDelaySeconds.value < 3) {
+    Message.warning('详情抓取间隔至少为 3 秒')
+    return
+  }
+  if (xhsProfileScrollDelaySeconds.value < 2) {
+    Message.warning('主页滚动间隔至少为 2 秒')
+    return
+  }
+
+  try {
+    await systemApi.updateConfigs([
+      { key: 'xhs_crawl_detail_delay_seconds', value: String(xhsCrawlDetailDelaySeconds.value) },
+      { key: 'xhs_profile_scroll_delay_seconds', value: String(xhsProfileScrollDelaySeconds.value) },
+    ])
+    Message.success('小红书抓取节奏已保存')
+  } catch (e: any) {
+    Message.error(getErrorMessage(e, '保存小红书抓取节奏失败'))
+  }
+}
+
 async function saveAutoSummaryEnabled() {
   try {
     await systemApi.updateConfigs([
@@ -1446,6 +1485,8 @@ async function loadSystemConfigs() {
       if (c.key === 'skip_crawl_when_login_degraded') skipCrawlWhenLoginDegraded.value = c.value !== 'false'
       if (c.key === 'cookie_failure_threshold') cookieFailureThreshold.value = parseInt(c.value) || 2
       if (c.key === 'risk_cooldown_minutes') riskCooldownMinutes.value = parseInt(c.value) || 0
+      if (c.key === 'xhs_crawl_detail_delay_seconds') xhsCrawlDetailDelaySeconds.value = Number(c.value) || 5
+      if (c.key === 'xhs_profile_scroll_delay_seconds') xhsProfileScrollDelaySeconds.value = Number(c.value) || 3
       if (c.key === 'napcat_ws_url' && c.value) napcatUrl.value = c.value
       if (c.key === 'napcat_token' && c.value) napcatToken.value = c.value
       if (c.key === 'login_notify_enabled') loginNotifyEnabled.value = c.value === 'true'
