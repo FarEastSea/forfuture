@@ -535,47 +535,117 @@ class TaskSchedulerService:
 
         # 引用原动态
         related_indices = analysis.get("related_records", [])
+        prepared_records, delivery_notes = await self._prepare_records_for_delivery(records, related_indices)
         for idx in related_indices[:3]:
-            if idx < len(records):
-                record = records[idx]
+            if idx < len(prepared_records):
+                record = prepared_records[idx]
                 ref_text = f"📌 原动态 [{record['platform'].upper()}] {record['author']} ({record['time']}):\n{record['content'][:500]}"
+                if delivery_notes.get(idx):
+                    ref_text += "\n⚠ 媒体状态：" + "；".join(delivery_notes[idx])
                 messages.append({"type": "text", "content": ref_text})
 
                 # 发送原动态图片
                 if "image" in fmt and record.get("images"):
                     for img in record["images"][:3]:
-                        img_path = img.get("local_path") or img.get("url", "")
-                        if img_path:
-                            from app.config import settings
-                            if img_path.startswith("/static/"):
-                                img_url = f"http://127.0.0.1:{settings.backend_port}{img_path}"
-                            else:
-                                img_url = img_path
+                        img_url = self._resolve_delivery_image_url(img, record.get("platform", ""))
+                        if img_url:
                             messages.append({"type": "image", "url": img_url})
 
         # 如果需要渲染图片（复杂内容）
         if "image" in fmt and len(related_indices) > 1:
-            html = self._render_summary_html(analysis, records, related_indices)
+            html = self._render_summary_html(analysis, prepared_records, related_indices, delivery_notes)
             messages.append({"type": "render_html", "html": html})
 
         return messages
 
-    def _render_summary_html(self, analysis: dict, records: list, indices: list) -> str:
+    def _build_static_delivery_url(self, local_path: str | None) -> str | None:
+        from app.config import settings
+
+        if not local_path or not isinstance(local_path, str) or not local_path.startswith("/static/"):
+            return None
+        return f"http://127.0.0.1:{settings.backend_port}{local_path}"
+
+    def _resolve_delivery_image_url(self, image_item, platform: str) -> str | None:
+        local_path = image_item.get("local_path") if isinstance(image_item, dict) else None
+        local_url = self._build_static_delivery_url(local_path)
+        if local_url:
+            return local_url
+        if platform == "qq":
+            return None
+        if isinstance(image_item, dict):
+            return image_item.get("url", "") or None
+        return str(image_item or "").strip() or None
+
+    async def _prepare_records_for_delivery(self, records: list[dict], indices: list[int]) -> tuple[list[dict], dict[int, list[str]]]:
+        from app.database import async_session
+        from app.models.qq_post import QQPost
+        from app.services.qq_crawler import qq_crawler
+
+        prepared_records = [dict(record) for record in records]
+        delivery_notes: dict[int, list[str]] = {}
+        qq_indices = [
+            idx for idx in indices[:5]
+            if idx < len(prepared_records)
+            and prepared_records[idx].get("platform") == "qq"
+            and prepared_records[idx].get("id")
+        ]
+        if not qq_indices:
+            return prepared_records, delivery_notes
+
+        changed = False
+        async with async_session() as db:
+            for idx in qq_indices:
+                record = prepared_records[idx]
+                post = await db.get(QQPost, record.get("id"))
+                if not post:
+                    record["images"] = []
+                    delivery_notes[idx] = ["媒体记录不存在，已跳过图片推送"]
+                    continue
+
+                status = await qq_crawler.ensure_post_media_local(post, overwrite=False)
+                if status.get("changed") or status["images_changed"] or status["avatar_repaired"] or status["video_repaired"]:
+                    changed = True
+
+                record["images"] = post.images or []
+                record["video_url"] = post.local_video_path or ""
+                record["author_avatar"] = post.author_avatar or ""
+
+                notes: list[str] = []
+                if status["missing_images"]:
+                    notes.append(f"图片 {status['missing_images']} 张已过期，未能补存到本地")
+                if status["video_missing"]:
+                    notes.append("视频已过期，未能补存到本地")
+                if status["avatar_missing"]:
+                    notes.append("头像未能补存到本地")
+                if notes:
+                    delivery_notes[idx] = notes
+
+            if changed:
+                await db.commit()
+
+        return prepared_records, delivery_notes
+
+    def _render_summary_html(self, analysis: dict, records: list, indices: list, delivery_notes: dict[int, list[str]] | None = None) -> str:
         """生成用于puppeteer渲染的HTML"""
+        delivery_notes = delivery_notes or {}
         cards = ""
         for idx in indices[:5]:
             if idx < len(records):
                 r = records[idx]
                 imgs_html = ""
                 for img in (r.get("images") or [])[:2]:
-                    path = img.get("local_path") or img.get("url", "")
+                    path = self._resolve_delivery_image_url(img, r.get("platform", ""))
                     if path:
                         imgs_html += f'<img src="{path}" style="max-width:200px;border-radius:8px;margin:4px">'
+                note_html = ""
+                if delivery_notes.get(idx):
+                    note_html = f'<div style="color:#ffb86c;font-size:12px;margin-top:8px">⚠ {"；".join(delivery_notes[idx])}</div>'
                 cards += f"""
                 <div style="background:#2a2a2a;border-radius:12px;padding:16px;margin:8px 0">
                     <div style="color:#888;font-size:12px">{r['platform'].upper()} · {r['author']} · {r['time']}</div>
                     <div style="color:#eee;margin:8px 0">{r['content'][:300]}</div>
                     <div>{imgs_html}</div>
+                    {note_html}
                 </div>"""
 
         return f"""<!DOCTYPE html>

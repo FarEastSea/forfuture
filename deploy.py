@@ -1,4 +1,5 @@
 """部署脚本：使用系统 OpenSSH 和 npm，不依赖本地虚拟环境。"""
+import argparse
 from collections.abc import Callable
 from datetime import datetime, timezone
 import os
@@ -6,6 +7,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -49,6 +52,10 @@ DEPLOY_BACKEND_PORT = os.getenv(
 ).strip()
 FRONTEND_RELEASES_KEEP = get_int_env("DEPLOY_FRONTEND_RELEASES_KEEP", 4)
 BACKEND_RELEASES_KEEP = get_int_env("DEPLOY_BACKEND_RELEASES_KEEP", 4)
+SSH_CONNECT_TIMEOUT = get_int_env("DEPLOY_SSH_CONNECT_TIMEOUT", 15)
+SSH_SERVER_ALIVE_INTERVAL = get_int_env("DEPLOY_SSH_SERVER_ALIVE_INTERVAL", 15)
+SSH_SERVER_ALIVE_COUNT_MAX = get_int_env("DEPLOY_SSH_SERVER_ALIVE_COUNT_MAX", 4)
+DEPLOY_LOCK_MAX_MINUTES = get_int_env("DEPLOY_LOCK_MAX_MINUTES", 120)
 
 NPM_CMD = shutil.which("npm.cmd" if os.name == "nt" else "npm") or shutil.which("npm")
 SSH_CMD = shutil.which("ssh")
@@ -66,6 +73,7 @@ BACKEND_RELEASE_EXCLUDED_PARTS = {
     "static",
     "logs",
 }
+PERSISTENT_BACKEND_PARTS = {"static", "logs"}
 BACKEND_RELEASE_EXCLUDED_SUFFIXES = {".pyc", ".pyo"}
 
 
@@ -80,6 +88,12 @@ def validate_deploy_settings():
     missing_settings = [name for name, value in required_settings.items() if not value]
     if missing_settings:
         raise RuntimeError("缺少部署环境变量: " + ", ".join(missing_settings))
+    missing_persistent_parts = sorted(PERSISTENT_BACKEND_PARTS - BACKEND_RELEASE_EXCLUDED_PARTS)
+    if missing_persistent_parts:
+        raise RuntimeError(
+            "部署保护缺失：以下后端持久化目录必须排除在 release 上传和清理之外: "
+            + ", ".join(missing_persistent_parts)
+        )
     if REMOTE_KEY_PATH and not Path(REMOTE_KEY_PATH).exists():
         raise RuntimeError(f"SSH 私钥不存在: {REMOTE_KEY_PATH}")
     if not SSH_CMD or not SCP_CMD:
@@ -129,7 +143,19 @@ def remote_shell_quote(value: str | Path) -> str:
 
 
 def ssh_base_args() -> list[str]:
-    args = [SSH_BIN, "-p", str(REMOTE_PORT), "-o", "StrictHostKeyChecking=accept-new"]
+    args = [
+        SSH_BIN,
+        "-p",
+        str(REMOTE_PORT),
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+        "-o",
+        f"ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}",
+        "-o",
+        f"ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}",
+    ]
     if REMOTE_KEY_PATH:
         args.extend(["-i", REMOTE_KEY_PATH, "-o", "BatchMode=yes"])
     args.append(remote_login())
@@ -137,7 +163,19 @@ def ssh_base_args() -> list[str]:
 
 
 def scp_base_args() -> list[str]:
-    args = [SCP_BIN, "-P", str(REMOTE_PORT), "-o", "StrictHostKeyChecking=accept-new"]
+    args = [
+        SCP_BIN,
+        "-P",
+        str(REMOTE_PORT),
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+        "-o",
+        f"ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}",
+        "-o",
+        f"ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}",
+    ]
     if REMOTE_KEY_PATH:
         args.extend(["-i", REMOTE_KEY_PATH, "-o", "BatchMode=yes"])
     return args
@@ -147,6 +185,12 @@ def run_remote_command(command: str, check: bool = True):
     return run_captured_command(
         ssh_base_args() + [f"bash -lc {shlex.quote(command)}"],
         check=check,
+    )
+
+
+def run_remote_streaming_command(command: str):
+    run_streaming_command(
+        ssh_base_args() + [f"bash -lc {shlex.quote(command)}"],
     )
 
 
@@ -170,25 +214,108 @@ def generate_release_id() -> str:
     return datetime.now(timezone.utc).strftime("release-%Y%m%d%H%M%S-%f")
 
 
-def acquire_remote_deploy_lock():
+def parse_cli_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="发布当前项目到远端服务器")
+    parser.add_argument(
+        "--force-unlock",
+        action="store_true",
+        help="获取部署锁前先强制清理已有锁目录",
+    )
+    parser.add_argument(
+        "--unlock-only",
+        action="store_true",
+        help="仅清理远端部署锁，不执行构建和部署",
+    )
+    parser.add_argument(
+        "--lock-max-minutes",
+        type=int,
+        default=DEPLOY_LOCK_MAX_MINUTES,
+        help=f"部署锁超过多少分钟视为残留锁并自动回收，默认 {DEPLOY_LOCK_MAX_MINUTES} 分钟",
+    )
+    return parser.parse_args()
+
+
+def acquire_remote_deploy_lock(*, force_unlock: bool = False, lock_max_minutes: int = DEPLOY_LOCK_MAX_MINUTES):
     print("\n=== 获取远端部署锁 ===")
     lock_root = f"{REMOTE_BASE}/.deploy"
     lock_dir = f"{lock_root}/deploy.lock"
+    max_age_seconds = max(60, int(lock_max_minutes) * 60)
     command = f'''
 set -e
 LOCK_ROOT={remote_shell_quote(lock_root)}
 LOCK_DIR={remote_shell_quote(lock_dir)}
+FORCE_UNLOCK={"1" if force_unlock else "0"}
+MAX_AGE_SECONDS={max_age_seconds}
+ACQUIRED_AT={remote_shell_quote(datetime.now(timezone.utc).isoformat())}
 
 mkdir -p "$LOCK_ROOT"
 
+write_lock() {{
+    printf '%s\n' "$ACQUIRED_AT" > "$LOCK_DIR/acquired_at"
+}}
+
 if mkdir "$LOCK_DIR" 2>/dev/null; then
-    printf '%s\n' {remote_shell_quote(datetime.now(timezone.utc).isoformat())} > "$LOCK_DIR/acquired_at"
-else
-    echo "已有部署任务在运行，请先清理锁目录: $LOCK_DIR" >&2
+    write_lock
+    echo "已获取部署锁"
+    exit 0
+fi
+
+LOCK_MTIME=$(stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0)
+NOW_TS=$(date +%s)
+LOCK_AGE=$((NOW_TS - LOCK_MTIME))
+if [ "$LOCK_AGE" -lt 0 ]; then
+    LOCK_AGE=0
+fi
+
+if [ "$FORCE_UNLOCK" = "1" ]; then
+    echo "强制清理已有部署锁: $LOCK_DIR"
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR"
+    write_lock
+    echo "已重新获取部署锁"
+    exit 0
+fi
+
+if [ "$LOCK_AGE" -ge "$MAX_AGE_SECONDS" ]; then
+    echo "发现残留部署锁（已存在 ${{LOCK_AGE}}s），自动回收: $LOCK_DIR"
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR"
+    write_lock
+    echo "已重新获取部署锁"
+    exit 0
+fi
+
+    echo "已有部署任务在运行，请稍后重试或使用 --force-unlock: $LOCK_DIR" >&2
+    if [ -f "$LOCK_DIR/acquired_at" ]; then
+        echo "锁创建时间: $(cat "$LOCK_DIR/acquired_at")" >&2
+    fi
+    echo "当前锁年龄: ${{LOCK_AGE}}s" >&2
     exit 1
+'''
+    result = run_remote_command(command)
+    output = (result.stdout or result.stderr).strip()
+    if output:
+        print(output[:600])
+
+
+def unlock_remote_deploy_lock():
+    print("\n=== 清理远端部署锁 ===")
+    lock_dir = f"{REMOTE_BASE}/.deploy/deploy.lock"
+    command = f'''
+set -e
+LOCK_DIR={remote_shell_quote(lock_dir)}
+
+if [ -d "$LOCK_DIR" ]; then
+    rm -rf "$LOCK_DIR"
+    echo "已清理部署锁: $LOCK_DIR"
+else
+    echo "部署锁不存在: $LOCK_DIR"
 fi
 '''
-    run_remote_command(command)
+    result = run_remote_command(command, check=False)
+    output = (result.stdout or result.stderr).strip()
+    if output:
+        print(output[:600])
 
 
 def release_remote_deploy_lock():
@@ -231,11 +358,73 @@ def upload_dir(
         upload_file(local_path, f"{remote_dir}/{relative_path}")
 
 
+def collect_upload_files(
+    local_dir: Path,
+    *,
+    file_filter: Callable[[Path], bool] | None = None,
+) -> list[Path]:
+    return sorted(
+        path
+        for path in local_dir.rglob("*")
+        if path.is_file() and (file_filter(path) if file_filter else True)
+    )
+
+
+def create_upload_archive(
+    local_dir: Path,
+    *,
+    file_filter: Callable[[Path], bool] | None = None,
+) -> tuple[Path, int]:
+    files = collect_upload_files(local_dir, file_filter=file_filter)
+    archive_handle = tempfile.NamedTemporaryFile(
+        prefix=f"{local_dir.name}-deploy-",
+        suffix=".tar",
+        delete=False,
+    )
+    archive_path = Path(archive_handle.name)
+    archive_handle.close()
+
+    try:
+        with tarfile.open(archive_path, "w") as archive:
+            for local_path in files:
+                archive.add(
+                    local_path,
+                    arcname=local_path.relative_to(local_dir).as_posix(),
+                    recursive=False,
+                )
+        return archive_path, len(files)
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
+
+
+def upload_dir_as_archive(
+    local_dir: Path,
+    remote_dir: str,
+    *,
+    file_filter: Callable[[Path], bool] | None = None,
+):
+    archive_path, file_count = create_upload_archive(local_dir, file_filter=file_filter)
+    remote_archive_path = f"{remote_dir}/.__deploy_bundle__.tar"
+    try:
+        print(f"  打包 {local_dir.name}：{file_count} 个文件")
+        upload_file(archive_path, remote_archive_path)
+        run_remote_command(
+            f"mkdir -p {remote_shell_quote(remote_dir)} && "
+            f"tar -xf {remote_shell_quote(remote_archive_path)} -C {remote_shell_quote(remote_dir)} && "
+            f"rm -f {remote_shell_quote(remote_archive_path)}"
+        )
+        print(f"  [OK] 已解包到 {remote_dir}（{file_count} 个文件）")
+    finally:
+        archive_path.unlink(missing_ok=True)
+
+
 def prepare_backend_release(release_id: str) -> str:
     print("\n=== 准备后端 release ===")
     backend_root = f"{REMOTE_BASE}/backend"
     releases_root = f"{backend_root}/.deploy/releases"
     release_dir = f"{releases_root}/{release_id}"
+    # backend/static 和 backend/logs 是持久化目录，只允许确保存在，不能随 release 切换清理。
     command = (
         f"rm -rf {remote_shell_quote(release_dir)} && "
         f"mkdir -p {remote_shell_quote(releases_root)} "
@@ -249,7 +438,7 @@ def prepare_backend_release(release_id: str) -> str:
 
 def upload_backend_release(release_dir: str):
     print("\n=== 上传后端 release ===")
-    upload_dir(BACKEND_DIR, release_dir, file_filter=should_include_backend_release_file)
+    upload_dir_as_archive(BACKEND_DIR, release_dir, file_filter=should_include_backend_release_file)
 
 
 def get_current_symlink_target(symlink_path: str) -> str | None:
@@ -318,7 +507,7 @@ def prepare_frontend_release(release_id: str) -> str:
 
 def upload_frontend_dist(release_dir: str):
     print("\n=== 上传前端 dist release ===")
-    upload_dir(FRONTEND_DIST, release_dir, index_last=True)
+    upload_dir_as_archive(FRONTEND_DIST, release_dir)
 
 
 def activate_frontend_release(release_id: str):
@@ -422,10 +611,8 @@ def run_database_migration(release_dir: str):
         f"cd {remote_shell_quote(release_dir)} && "
         f"{remote_shell_quote(PYTHON_BIN)} -m alembic upgrade head 2>&1"
     )
-    result = run_remote_command(command)
-    output = (result.stdout or result.stderr).strip()
-    if output:
-        print(output[:600])
+    print("  远端执行 alembic upgrade head")
+    run_remote_streaming_command(command)
 
 
 def restart_backend_service():
@@ -584,11 +771,22 @@ def verify_remote_health():
 
 
 def main():
+    args = parse_cli_args()
     validate_deploy_settings()
+
+    if args.unlock_only:
+        print(f"连接到 {REMOTE_HOST}:{REMOTE_PORT}...")
+        print("仅执行远端部署锁清理\n")
+        unlock_remote_deploy_lock()
+        return
+
     print(f"连接到 {REMOTE_HOST}:{REMOTE_PORT}...")
     print("使用系统 OpenSSH 和 npm 执行部署\n")
     release_id = generate_release_id()
-    acquire_remote_deploy_lock()
+    acquire_remote_deploy_lock(
+        force_unlock=args.force_unlock,
+        lock_max_minutes=max(1, args.lock_max_minutes),
+    )
 
     try:
         ensure_frontend_build()

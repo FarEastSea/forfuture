@@ -1648,6 +1648,406 @@ class QQCrawler:
         file_path = os.path.join(settings.static_dir, local_path[len("/static/"):])
         return not os.path.isfile(file_path)
 
+    def _normalize_media_url_candidates(self, candidates) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates or []:
+            url = candidate.strip() if isinstance(candidate, str) else str(candidate or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            normalized.append(url)
+        return normalized
+
+    def _build_api_image_sources(self, pics: list[dict] | None) -> list[dict]:
+        image_sources: list[dict] = []
+        for pic in pics or []:
+            candidate_urls = self._normalize_media_url_candidates([
+                pic.get("url3", ""),
+                pic.get("url2", ""),
+                pic.get("url1", ""),
+            ])
+            if not candidate_urls:
+                continue
+            image_sources.append({
+                "url": candidate_urls[0],
+                "candidates": candidate_urls,
+            })
+        return image_sources
+
+    async def _download_image_records(self, raw_images: list | None) -> list[dict]:
+        from app.services.media_service import media_service
+
+        image_records: list[dict] = []
+        for raw_image in raw_images or []:
+            primary_url = ""
+            candidate_urls: list[str] = []
+
+            if isinstance(raw_image, dict):
+                primary_url = str(raw_image.get("url") or "").strip()
+                candidate_urls = self._normalize_media_url_candidates(
+                    raw_image.get("candidates")
+                    or raw_image.get("urls")
+                    or [primary_url]
+                )
+            elif isinstance(raw_image, (list, tuple, set)):
+                candidate_urls = self._normalize_media_url_candidates(list(raw_image))
+            else:
+                primary_url = str(raw_image or "").strip()
+                candidate_urls = self._normalize_media_url_candidates([primary_url])
+
+            if not primary_url and candidate_urls:
+                primary_url = candidate_urls[0]
+            if not primary_url and not candidate_urls:
+                continue
+
+            local_path = await media_service.download_image_multi_url(candidate_urls, "qq") if candidate_urls else None
+            image_records.append({
+                "url": primary_url,
+                "local_path": local_path,
+            })
+
+        return image_records
+
+    def _build_image_source_for_record(self, image_item: dict | None, pic_sources: list[dict]) -> dict | None:
+        original_url = str((image_item or {}).get("url") or "").strip()
+        if not original_url:
+            return None
+        for source in pic_sources:
+            if original_url == source.get("url"):
+                return source
+            if original_url in (source.get("candidates") or []):
+                return source
+        return {"url": original_url, "candidates": [original_url]}
+
+    def _count_missing_image_records(self, image_records: list[dict] | None) -> int:
+        missing = 0
+        for image_item in image_records or []:
+            if not isinstance(image_item, dict):
+                missing += 1
+                continue
+            if self._is_local_static_file_missing(image_item.get("local_path")):
+                missing += 1
+        return missing
+
+    def _normalize_existing_image_records(self, current_images: list | None) -> list[dict]:
+        normalized: list[dict] = []
+        for image_item in current_images or []:
+            if isinstance(image_item, dict):
+                normalized.append(dict(image_item))
+            else:
+                normalized.append({
+                    "url": str(image_item or "").strip(),
+                    "local_path": None,
+                })
+        return normalized
+
+    def _find_preservable_image_record(
+        self,
+        source: dict | None,
+        current_records: list[dict],
+        *,
+        used_indexes: set[int],
+        preferred_index: int | None = None,
+    ) -> tuple[int | None, dict | None]:
+        candidate_urls = set(
+            self._normalize_media_url_candidates(
+                (source or {}).get("candidates")
+                or [(source or {}).get("url", "")]
+            )
+        )
+
+        for idx, record in enumerate(current_records):
+            if idx in used_indexes or self._is_local_static_file_missing(record.get("local_path")):
+                continue
+            existing_url = str(record.get("url") or "").strip()
+            if existing_url and existing_url in candidate_urls:
+                return idx, dict(record)
+
+        if preferred_index is not None and 0 <= preferred_index < len(current_records):
+            record = current_records[preferred_index]
+            if preferred_index not in used_indexes and not self._is_local_static_file_missing(record.get("local_path")):
+                return preferred_index, dict(record)
+
+        return None, None
+
+    async def _ensure_image_records_local(
+        self,
+        post_id: str,
+        current_images: list | None,
+        pic_sources: list[dict],
+        *,
+        overwrite: bool,
+    ) -> tuple[list[dict], bool, int]:
+        current_records = self._normalize_existing_image_records(current_images)
+
+        if overwrite:
+            if not pic_sources:
+                preserved_records = [
+                    dict(record)
+                    for record in current_records
+                    if not self._is_local_static_file_missing(record.get("local_path"))
+                ]
+                if preserved_records:
+                    self._log(
+                        f"覆盖图片: {post_id} 未拿到新图片资源，保留 {len(preserved_records)} 张现有本地图片",
+                        "warning",
+                    )
+                    return preserved_records, preserved_records != current_records, 0
+                return [], bool(current_records), 0
+
+            downloaded_records = await self._download_image_records(pic_sources)
+            overwritten_records: list[dict] = []
+            used_indexes: set[int] = set()
+            preserved_count = 0
+
+            for idx, source in enumerate(pic_sources):
+                downloaded_record = dict(downloaded_records[idx]) if idx < len(downloaded_records) else {
+                    "url": str(source.get("url") or "").strip(),
+                    "local_path": None,
+                }
+
+                match_idx, preserved_record = self._find_preservable_image_record(
+                    source,
+                    current_records,
+                    used_indexes=used_indexes,
+                    preferred_index=idx,
+                )
+
+                if not self._is_local_static_file_missing(downloaded_record.get("local_path")):
+                    if match_idx is not None:
+                        used_indexes.add(match_idx)
+                elif preserved_record:
+                    downloaded_record["local_path"] = preserved_record.get("local_path")
+                    if not downloaded_record.get("url"):
+                        downloaded_record["url"] = preserved_record.get("url", "")
+                    used_indexes.add(match_idx)
+                    preserved_count += 1
+
+                overwritten_records.append(downloaded_record)
+
+            for idx, record in enumerate(current_records):
+                if idx in used_indexes or self._is_local_static_file_missing(record.get("local_path")):
+                    continue
+                overwritten_records.append(dict(record))
+                preserved_count += 1
+
+            missing_after = self._count_missing_image_records(overwritten_records)
+            if pic_sources:
+                done = len(overwritten_records) - missing_after
+                if preserved_count:
+                    self._log(
+                        f"覆盖图片: {post_id} → {done}/{len(overwritten_records)} 张已本地化，保留 {preserved_count} 张现有本地图片",
+                        "warning",
+                    )
+                else:
+                    self._log(f"覆盖图片: {post_id} → {done}/{len(overwritten_records)} 张已本地化")
+            return overwritten_records, overwritten_records != current_records, missing_after
+
+        if not current_records:
+            downloaded_records = await self._download_image_records(pic_sources)
+            missing_after = self._count_missing_image_records(downloaded_records)
+            if downloaded_records:
+                done = len(downloaded_records) - missing_after
+                self._log(f"补充图片: {post_id} → {done}/{len(downloaded_records)} 张已本地化")
+            return downloaded_records, bool(downloaded_records), missing_after
+
+        changed = False
+        repaired = 0
+        new_images: list[dict] = []
+        existing_urls: set[str] = set()
+
+        for image_item in current_records:
+            if isinstance(image_item, dict):
+                record = dict(image_item)
+            else:
+                record = {
+                    "url": str(image_item or "").strip(),
+                    "local_path": None,
+                }
+                changed = True
+            if record.get("url"):
+                existing_urls.add(record["url"])
+
+            if not self._is_local_static_file_missing(record.get("local_path")):
+                new_images.append(record)
+                continue
+
+            if record.get("local_path"):
+                record["local_path"] = None
+                changed = True
+
+            source = self._build_image_source_for_record(record, pic_sources)
+            downloaded = await self._download_image_records([source] if source else [])
+            if downloaded and downloaded[0].get("local_path"):
+                repaired_record = downloaded[0]
+                record["url"] = repaired_record.get("url") or record.get("url", "")
+                record["local_path"] = repaired_record["local_path"]
+                changed = True
+                repaired += 1
+                self._log(f"修复图片: {post_id} → {record['local_path']}")
+            new_images.append(record)
+
+        for source in pic_sources:
+            source_url = str(source.get("url") or "").strip()
+            if not source_url or source_url in existing_urls:
+                continue
+            downloaded = await self._download_image_records([source])
+            if downloaded:
+                new_images.extend(downloaded)
+                changed = True
+                existing_urls.add(source_url)
+
+        missing_after = self._count_missing_image_records(new_images)
+        if repaired and missing_after:
+            self._log(f"QQ说说 {post_id} 仍有 {missing_after} 张图片未能恢复到本地", "warning")
+        return new_images, changed, missing_after
+
+    async def _download_qq_avatar(self, author_uin: str) -> str | None:
+        from app.services.media_service import media_service
+
+        if not author_uin:
+            return None
+        avatar_cdn = f"https://q.qlogo.cn/headimg_dl?dst_uin={author_uin}&spec=640&img_type=jpg"
+        return await media_service.download_image(avatar_cdn, "avatar")
+
+    def _extract_video_url(self, video_list: list | None) -> str:
+        for video_item in video_list or []:
+            if not isinstance(video_item, dict):
+                continue
+            video_url = (
+                video_item.get("url3", "")
+                or video_item.get("url2", "")
+                or video_item.get("url1", "")
+                or video_item.get("video_url", "")
+            )
+            if video_url:
+                return video_url
+        return ""
+
+    async def _download_qq_video(self, video_url: str) -> str | None:
+        from app.services.media_service import media_service
+
+        if not video_url:
+            return None
+        return await media_service.download_video(video_url, "qq")
+
+    async def ensure_post_media_local(self, post, msg: dict | None = None, *, overwrite: bool = False) -> dict:
+        from sqlalchemy.orm.attributes import flag_modified
+
+        payload = msg if isinstance(msg, dict) else (post.raw_data if isinstance(getattr(post, "raw_data", None), dict) else {})
+        post_id = getattr(post, "post_id", "") or str(getattr(post, "id", "") or "unknown")
+        pic_sources = self._build_api_image_sources(payload.get("pic", []))
+        current_images = getattr(post, "images", None) or []
+
+        image_records, images_changed, missing_images = await self._ensure_image_records_local(
+            post_id,
+            current_images,
+            pic_sources,
+            overwrite=overwrite,
+        )
+        image_state_changed = image_records != self._normalize_existing_image_records(current_images)
+        if image_state_changed:
+            post.images = image_records
+            try:
+                flag_modified(post, "images")
+            except Exception:
+                pass
+
+        status = {
+            "images_changed": image_state_changed,
+            "missing_images": missing_images,
+            "avatar_repaired": False,
+            "avatar_missing": False,
+            "video_repaired": False,
+            "video_missing": False,
+            "changed": image_state_changed,
+        }
+
+        author_uin = str(payload.get("uin") or getattr(post, "author_qq", "") or getattr(post, "qq_number", "") or "")
+        if author_uin and self._is_local_static_file_missing(getattr(post, "author_avatar", None)):
+            current_avatar = getattr(post, "author_avatar", None)
+            local_avatar = await self._download_qq_avatar(author_uin)
+            if local_avatar:
+                post.author_avatar = local_avatar
+                status["avatar_repaired"] = True
+                status["changed"] = True
+            else:
+                if current_avatar:
+                    post.author_avatar = ""
+                    status["changed"] = True
+                status["avatar_missing"] = True
+
+        video_url = self._extract_video_url(payload.get("video", [])) or str(getattr(post, "video_url", "") or "").strip()
+        if video_url:
+            post.video_url = video_url
+            if overwrite or self._is_local_static_file_missing(getattr(post, "local_video_path", None)):
+                current_local_video = getattr(post, "local_video_path", "")
+                current_local_video_available = bool(current_local_video) and not self._is_local_static_file_missing(current_local_video)
+                if current_local_video and not current_local_video_available:
+                    self._log(f"QQ说说 {post_id} 本地视频缺失，尝试重新下载", "warning")
+                local_video = await self._download_qq_video(video_url)
+                if local_video:
+                    post.local_video_path = local_video
+                    status["video_repaired"] = True
+                    status["changed"] = True
+                    self._log(f"补充/修复视频: {post_id}")
+                elif current_local_video_available:
+                    self._log(f"QQ说说 {post_id} 覆盖视频下载失败，保留现有本地视频", "warning")
+                else:
+                    if current_local_video:
+                        status["changed"] = True
+                    post.local_video_path = ""
+                    status["video_missing"] = True
+        elif overwrite and (getattr(post, "video_url", "") or getattr(post, "local_video_path", "")):
+            current_local_video = getattr(post, "local_video_path", "")
+            if current_local_video and not self._is_local_static_file_missing(current_local_video):
+                self._log(f"QQ说说 {post_id} 覆盖结果未返回视频资源，保留现有本地视频", "warning")
+            else:
+                post.video_url = ""
+                post.local_video_path = ""
+                status["changed"] = True
+
+        return status
+
+    def _post_has_missing_local_media(self, post) -> bool:
+        if self._is_local_static_file_missing(getattr(post, "author_avatar", None)):
+            return True
+        if getattr(post, "video_url", "") and self._is_local_static_file_missing(getattr(post, "local_video_path", None)):
+            return True
+        return self._count_missing_image_records(getattr(post, "images", None) or []) > 0
+
+    async def _backfill_missing_local_media(self, qq: str) -> dict[str, int]:
+        from sqlalchemy import select
+        from app.database import async_session
+        from app.models.qq_post import QQPost
+
+        scanned = 0
+        repaired = 0
+        unresolved = 0
+        changed = False
+
+        async with async_session() as db:
+            result = await db.execute(select(QQPost).where(QQPost.qq_number == qq))
+            posts = result.scalars().all()
+            for post in posts:
+                if not self._post_has_missing_local_media(post):
+                    continue
+                scanned += 1
+                status = await self.ensure_post_media_local(post, overwrite=False)
+                if status["images_changed"] or status["avatar_repaired"] or status["video_repaired"]:
+                    repaired += 1
+                if status.get("changed"):
+                    changed = True
+                if status["missing_images"] or status["avatar_missing"] or status["video_missing"]:
+                    unresolved += 1
+            if changed:
+                await db.commit()
+
+        if scanned:
+            self._log(f"QQ={qq} 历史媒体回补: 扫描 {scanned} 条，修复 {repaired} 条，仍缺失 {unresolved} 条")
+        return {"scanned": scanned, "repaired": repaired, "unresolved": unresolved}
+
     async def _save_qq_comments(self, db, post, comments: list[dict]) -> int:
         if not comments:
             return 0
@@ -1927,89 +2327,19 @@ class QQCrawler:
                                         existing_post.location = location
                                     existing_post.raw_data = msg
 
-                                    # 补充头像（如果之前为空或文件不存在）
-                                    avatar_missing = not existing_post.author_avatar
-                                    if existing_post.author_avatar and existing_post.author_avatar.startswith("/static/"):
-                                        fp = os.path.join(settings.static_dir, existing_post.author_avatar[len("/static/"):])
-                                        if not os.path.isfile(fp):
-                                            avatar_missing = True
-                                    if avatar_missing:
-                                        author_uin = str(msg.get("uin", qq))
-                                        avatar_cdn = f"https://q.qlogo.cn/headimg_dl?dst_uin={author_uin}&spec=640&img_type=jpg"
-                                        local_av = await media_service.download_image(avatar_cdn, "avatar")
-                                        if local_av:
-                                            existing_post.author_avatar = local_av
-
-                                    # 覆盖模式：重新下载所有图片和视频
-                                    if overwrite:
-                                        image_url_groups = []
-                                        image_urls = []
-                                        for pic in msg.get("pic", []):
-                                            all_urls = [pic.get("url3", ""), pic.get("url2", ""), pic.get("url1", "")]
-                                            all_urls = [u for u in all_urls if u]
-                                            if all_urls:
-                                                image_url_groups.append(all_urls)
-                                                image_urls.append(all_urls[0])
-                                        new_images_ow = []
-                                        for i, url_group in enumerate(image_url_groups):
-                                            local_path = await media_service.download_image_multi_url(url_group, "qq")
-                                            new_images_ow.append({"url": image_urls[i] if i < len(image_urls) else url_group[0], "local_path": local_path})
-                                        if new_images_ow:
-                                            existing_post.images = new_images_ow
-                                            flag_modified(existing_post, "images")
-                                            self._log(f"覆盖图片: {post_id} → {len(new_images_ow)} 张")
-                                        if new_content:
-                                            existing_post.content = new_content
-                                        # 覆盖视频
-                                        video_list = msg.get("video", [])
-                                        if video_list and isinstance(video_list, list):
-                                            for vid in video_list:
-                                                vid_url = vid.get("url3", "") or vid.get("url2", "") or vid.get("url1", "") or vid.get("video_url", "")
-                                                if vid_url:
-                                                    existing_post.video_url = vid_url
-                                                    local_video = await media_service.download_video(vid_url, "qq")
-                                                    if local_video:
-                                                        existing_post.local_video_path = local_video
-                                                        self._log(f"覆盖视频: {post_id}")
-                                                    break
-                                    else:
-                                        # 修复图片：检查是否有images中local_path为null或文件不存在的，尝试重新下载
-                                        if existing_post.images:
-                                            repaired = False
-                                            new_images = []
-                                            for img_item in existing_post.images:
-                                                lp = img_item.get("local_path") if isinstance(img_item, dict) else None
-                                                file_missing = False
-                                                if isinstance(img_item, dict) and not lp:
-                                                    file_missing = True
-                                                elif isinstance(img_item, dict) and lp and lp.startswith("/static/"):
-                                                    fp = os.path.join(settings.static_dir, lp[len("/static/"):])
-                                                    if not os.path.isfile(fp):
-                                                        file_missing = True
-                                                if file_missing:
-                                                    # 尝试用raw_data中的多个URL重新下载
-                                                    pic_urls = []
-                                                    orig_url = img_item.get("url", "") if isinstance(img_item, dict) else ""
-                                                    if orig_url:
-                                                        pic_urls.append(orig_url)
-                                                    # 从当前API响应的pic数组中找到匹配的pic项，收集所有URL
-                                                    for pic in msg.get("pic", []):
-                                                        all_pic_urls = [pic.get("url1", ""), pic.get("url2", ""), pic.get("url3", "")]
-                                                        if orig_url in all_pic_urls:
-                                                            pic_urls = [u for u in all_pic_urls if u and u != orig_url]
-                                                            pic_urls.insert(0, orig_url)
-                                                            break
-                                                    local_path = await media_service.download_image_multi_url(pic_urls, "qq") if pic_urls else None
-                                                    if local_path:
-                                                        img_item["local_path"] = local_path
-                                                        repaired = True
-                                                        self._log(f"修复图片: {post_id} → {local_path}")
-                                                    new_images.append(img_item)
-                                                else:
-                                                    new_images.append(img_item)
-                                            if repaired:
-                                                existing_post.images = new_images
-                                                flag_modified(existing_post, "images")
+                                    media_status = await self.ensure_post_media_local(
+                                        existing_post,
+                                        msg,
+                                        overwrite=overwrite,
+                                    )
+                                    if media_status["missing_images"] or media_status["avatar_missing"] or media_status["video_missing"]:
+                                        self._log(
+                                            f"QQ说说 {post_id} 仍有媒体未能落本地: 图片缺失={media_status['missing_images']}, "
+                                            f"头像缺失={media_status['avatar_missing']}, 视频缺失={media_status['video_missing']}",
+                                            "warning",
+                                        )
+                                    if new_content:
+                                        existing_post.content = new_content
 
                                     # 内容变化时记录编辑历史
                                     if "content" in changes:
@@ -2021,23 +2351,6 @@ class QQCrawler:
                                         existing_post.edit_history = history
                                         existing_post.content = new_content
                                         self._log(f"QQ说说 {post_id} 内容已更新")
-
-                                    # 补充或修复视频（本地文件丢失时用本轮API里的新URL重新下载）
-                                    if self._is_local_static_file_missing(existing_post.local_video_path):
-                                        if existing_post.local_video_path:
-                                            self._log(f"QQ说说 {post_id} 本地视频缺失，尝试重新下载", "warning")
-                                            existing_post.local_video_path = ""
-                                        video_list = msg.get("video", [])
-                                        if video_list and isinstance(video_list, list):
-                                            for vid in video_list:
-                                                vid_url = vid.get("url3", "") or vid.get("url2", "") or vid.get("url1", "") or vid.get("video_url", "")
-                                                if vid_url:
-                                                    existing_post.video_url = vid_url
-                                                    local_video = await media_service.download_video(vid_url, "qq")
-                                                    if local_video:
-                                                        existing_post.local_video_path = local_video
-                                                        self._log(f"补充/修复视频: {post_id}")
-                                                    break
 
                                     # 增量更新评论
                                     commentlist = msg.get("commentlist") or []
@@ -2058,26 +2371,13 @@ class QQCrawler:
                                     continue
 
                                 # --- 新说说：创建 ---
-                                image_urls = []
-                                image_url_groups = []  # 每张图片的多URL候选
-                                for pic in msg.get("pic", []):
-                                    # 收集该图片所有URL变体（不同CDN/尺寸）
-                                    all_urls = [pic.get("url3", ""), pic.get("url2", ""), pic.get("url1", "")]
-                                    all_urls = [u for u in all_urls if u]
-                                    if all_urls:
-                                        image_url_groups.append(all_urls)
-                                        image_urls.append(all_urls[0])  # 主URL用于记录
-
-                                # 用multi_url方式下载每张图片（自动尝试多个CDN）
-                                images = []
-                                for i, url_group in enumerate(image_url_groups):
-                                    local_path = await media_service.download_image_multi_url(url_group, "qq")
-                                    images.append({"url": image_urls[i] if i < len(image_urls) else url_group[0], "local_path": local_path})
+                                images = await self._download_image_records(
+                                    self._build_api_image_sources(msg.get("pic", []))
+                                )
 
                                 # 下载作者头像
                                 author_uin = str(msg.get("uin", qq))
-                                avatar_cdn = f"https://q.qlogo.cn/headimg_dl?dst_uin={author_uin}&spec=640&img_type=jpg"
-                                local_avatar = await media_service.download_image(avatar_cdn, "avatar")
+                                local_avatar = await self._download_qq_avatar(author_uin)
 
                                 post_time = None
                                 if msg.get("created_time"):
@@ -2091,18 +2391,8 @@ class QQCrawler:
                                     forward_content = msg["rt_con"]["content"]
 
                                 # 提取视频
-                                video_url = ""
-                                local_video_path = ""
-                                video_list = msg.get("video", [])
-                                if video_list and isinstance(video_list, list):
-                                    for vid in video_list:
-                                        vid_url = vid.get("url3", "") or vid.get("url2", "") or vid.get("url1", "") or vid.get("video_url", "")
-                                        if vid_url:
-                                            video_url = vid_url
-                                            local_video = await media_service.download_video(vid_url, "qq")
-                                            if local_video:
-                                                local_video_path = local_video
-                                            break
+                                video_url = self._extract_video_url(msg.get("video", []))
+                                local_video_path = await self._download_qq_video(video_url) if video_url else ""
 
                                 post = QQPost(
                                     qq_number=qq,
@@ -2165,6 +2455,10 @@ class QQCrawler:
 
                         await asyncio.sleep(0.5)  # 避免请求过快
 
+                    backfill_result = {"scanned": 0, "repaired": 0, "unresolved": 0}
+                    if not target_error:
+                        backfill_result = await self._backfill_missing_local_media(qq)
+
                     if target_error:
                         self._log(f"QQ={qq} 抓取未完成: {target_error}", "warning")
                         self._status["progress"] = f"{qq}: 抓取未完成 ({target_error})"
@@ -2175,6 +2469,7 @@ class QQCrawler:
                             "fetched": total_fetched,
                             "saved": saved_count,
                             "updated": updated_count,
+                            "media_backfill": backfill_result,
                         })
                         continue
 
@@ -2188,6 +2483,7 @@ class QQCrawler:
                         "updated": updated_count,
                         "stop_reason": stop_reason,
                         "page_limit": self._max_api_pages if stop_reason == "page_limit_reached" else None,
+                        "media_backfill": backfill_result,
                     })
                     any_success = True
 
@@ -2355,13 +2651,54 @@ class QQCrawler:
                                         item.querySelector('.f-nick, .user-name, .f-name, .nickname, [class*="nick"], [class*="author"]')?.innerText || ''
                                     ).trim();
                                     const avatar = item.querySelector('.f-head img, .user-avatar img, img[class*="avatar"], img[class*="head"]')?.src || '';
+                                    const extractBackgroundUrl = value => {
+                                        const match = (value || '').match(/url\\(["']?(.*?)["']?\\)/i);
+                                        return match ? match[1] : '';
+                                    };
+                                    const collectImageCandidates = img => {
+                                        const values = [
+                                            img.currentSrc || '',
+                                            img.src || '',
+                                            img.getAttribute('data-src') || '',
+                                            img.getAttribute('data-origin') || '',
+                                            img.getAttribute('data-original') || '',
+                                            img.getAttribute('data-loadsrc') || '',
+                                            img.getAttribute('data-pic') || '',
+                                            extractBackgroundUrl(img.getAttribute('style') || ''),
+                                            extractBackgroundUrl(window.getComputedStyle(img).backgroundImage || ''),
+                                            extractBackgroundUrl(window.getComputedStyle(img.parentElement || img).backgroundImage || ''),
+                                        ];
+                                        const srcset = img.getAttribute('srcset') || '';
+                                        if (srcset) {
+                                            srcset.split(',').forEach(part => {
+                                                const src = (part.trim().split(/\\s+/)[0] || '').trim();
+                                                if (src) values.push(src);
+                                            });
+                                        }
+
+                                        const result = [];
+                                        const seen = new Set();
+                                        values.forEach(value => {
+                                            const src = (value || '').trim();
+                                            if (!src || src.startsWith('data:')) return;
+                                            const lower = src.toLowerCase();
+                                            if (lower.includes('avatar') || lower.includes('head') || lower.includes('icon') || lower.includes('emoji')) {
+                                                return;
+                                            }
+                                            if (seen.has(src)) return;
+                                            seen.add(src);
+                                            result.push(src);
+                                        });
+                                        return result;
+                                    };
                                     const images = [];
                                     item.querySelectorAll('img').forEach(img => {
-                                        const src = img.src || '';
-                                        if (src && !src.includes('avatar') && !src.includes('head') 
-                                            && !src.includes('icon') && !src.includes('emoji')
-                                            && img.naturalWidth > 50) {
-                                            images.push(src);
+                                        const candidates = collectImageCandidates(img);
+                                        if (candidates.length > 0) {
+                                            images.push({
+                                                url: candidates[0],
+                                                candidates,
+                                            });
                                         }
                                     });
                                     // 提取点赞和评论数
@@ -2449,7 +2786,7 @@ class QQCrawler:
                             if existing.scalar_one_or_none():
                                 continue
 
-                            images = await media_service.download_images(pd.get("images", []), "qq")
+                            images = await self._download_image_records(pd.get("images", []))
                             post = QQPost(
                                 qq_number=qq,
                                 post_id=post_id,
