@@ -109,7 +109,7 @@
 
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
-import { taskApi } from '@/api'
+import { v2Api } from '@/api/v2'
 import { Message } from '@arco-design/web-vue'
 import {
   IconPlus, IconClockCircle, IconPlayArrow, IconEdit, IconDelete
@@ -134,8 +134,8 @@ async function loadTasks() {
   loading.value = true
   taskError.value = ''
   try {
-    const { data } = await taskApi.getTasks()
-    tasks.value = data || []
+    const { data } = await v2Api.listTasks()
+    tasks.value = data.items || []
   } catch (error) {
     tasks.value = []
     taskError.value = getErrorMessage(error, '暂时无法读取任务列表，请稍后重试。')
@@ -178,10 +178,10 @@ async function saveTask() {
   }
   try {
     if (editingTask.value) {
-      await taskApi.updateTask(editingTask.value.id, payload)
+      await v2Api.updateTask(editingTask.value.id, payload)
       Message.success('更新成功')
     } else {
-      await taskApi.createTask(payload)
+      await v2Api.createTask(payload)
       Message.success('创建成功')
     }
     modalVisible.value = false
@@ -193,7 +193,7 @@ async function saveTask() {
 
 async function toggleTask(task: any) {
   try {
-    await taskApi.toggleTask(task.id)
+    await v2Api.toggleTask(task.id)
   } catch (error) {
     task.is_active = !task.is_active
     Message.error(getErrorMessage(error, '切换任务状态失败，请稍后重试。'))
@@ -202,7 +202,7 @@ async function toggleTask(task: any) {
 
 async function deleteTask(id: number) {
   try {
-    await taskApi.deleteTask(id)
+    await v2Api.deleteTask(id)
     Message.success('任务已删除')
     loadTasks()
   } catch (error) {
@@ -212,7 +212,7 @@ async function deleteTask(id: number) {
 
 async function runNow(task: any) {
   try {
-    await taskApi.runNow(task.id)
+    await v2Api.runTaskNow(task.id)
     Message.success('任务已触发执行')
   } catch (e: any) { Message.error(e.response?.data?.detail || '执行失败') }
 }
@@ -223,10 +223,10 @@ async function loadLogs(taskId: number) {
     [taskId]: true,
   }
   try {
-    const { data } = await taskApi.getLogs(taskId)
+    const { data } = await v2Api.listTaskRuns(taskId)
     taskLogs.value = {
       ...taskLogs.value,
-      [taskId]: data || [],
+      [taskId]: data.items || [],
     }
   } catch (error) {
     Message.error(getErrorMessage(error, '任务日志加载失败，请稍后重试。'))

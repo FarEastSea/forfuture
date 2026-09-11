@@ -1,0 +1,24 @@
+{
+  "data": {
+    "has_more": true,
+    "cursor": "next-cursor",
+    "comments": [
+      {
+        "id": "c1",
+        "content": "顶",
+        "like_count": 2,
+        "create_time": 1710000000000,
+        "user_info": {"user_id": "u2", "nickname": "Dan"},
+        "sub_comments": [
+          {
+            "id": "c1-1",
+            "content": "回复你",
+            "create_time": 1710000060000,
+            "user_info": {"user_id": "u1", "nickname": "Carol"},
+            "show_tags": ["is_author"]
+          }
+        ]
+      }
+    ]
+  }
+}

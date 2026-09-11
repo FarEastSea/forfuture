@@ -192,6 +192,7 @@ import {
   IconMoonFill,
   IconRefresh,
   IconRobot,
+  IconSearch,
   IconSettings,
   IconSunFill,
 } from '@arco-design/web-vue/es/icon'
@@ -203,6 +204,7 @@ type ThemeMode = 'light' | 'dark' | 'auto'
 const navItems = [
   { key: 'qq', label: 'QQ空间', icon: IconMessage },
   { key: 'xhs', label: '小红书', icon: IconBook },
+  { key: 'knowledge', label: '知识库', icon: IconSearch },
   { key: 'chat', label: 'AI对话', icon: IconRobot },
   { key: 'tasks', label: '定时任务', icon: IconClockCircle },
   { key: 'settings', label: '设置', icon: IconSettings },
@@ -220,6 +222,12 @@ const moduleMeta = {
     title: '小红书内容板',
     description: '以卡片流方式整理笔记、评论和标签，让内容表达与互动模式一眼成形。',
     highlights: ['笔记卡片', '评论关系', '标签聚类'],
+  },
+  knowledge: {
+    badge: 'Memory index',
+    title: '知识库检索',
+    description: '对已采集记录做分块检索，按平台、作者和关键词把材料找回来。',
+    highlights: ['双路检索', '结构化过滤', '增量索引'],
   },
   chat: {
     badge: 'Insight console',
@@ -261,8 +269,6 @@ const adminTokenHint = ref('')
 
 let ws: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
-let statusPollTimer: ReturnType<typeof setInterval> | null = null
-let pingTimer: ReturnType<typeof setInterval> | null = null
 
 const currentRoute = computed(() => route.path.split('/')[1] || 'qq')
 const currentModule = computed(() => moduleMeta[currentRoute.value as keyof typeof moduleMeta] || moduleMeta.qq)
@@ -365,7 +371,7 @@ async function fetchNapcatStatus() {
   }
 
   try {
-    const { data } = await axios.get('/api/system/napcat-status', {
+    const { data } = await axios.get('/api/v2/system/napcat-status', {
       headers: buildAdminAuthHeaders(),
     })
     lastCheckTime.value = new Date().toLocaleTimeString('zh-CN')
@@ -407,31 +413,20 @@ function connectWS() {
   }
   wsStatus.value = 'connecting'
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  ws = openAdminWebSocket(`${protocol}//${location.host}/ws/client`)
+  ws = openAdminWebSocket(`${protocol}//${location.host}/ws/v2/events`)
 
   ws.onopen = () => {
     wsStatus.value = 'connected'
     adminTokenModalVisible.value = false
-    if (pingTimer) clearInterval(pingTimer)
-    pingTimer = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'ping' }))
-      }
-    }, 25000)
   }
 
   ws.onmessage = (event) => {
     try {
       const data = JSON.parse(event.data)
-      if (data.type === 'pong' || data.type === 'server_ping') return
-      if (data.type === 'napcat_connected') {
-        napcatConnected.value = true
-        napcatQQ.value = data.qq || ''
-        lastCheckTime.value = new Date().toLocaleTimeString('zh-CN')
-      }
-      if (data.type === 'napcat_disconnected') {
-        napcatConnected.value = false
-        napcatQQ.value = ''
+      if (data.type === 'napcat.status') {
+        const status = data.payload || {}
+        napcatConnected.value = Number(status.connected_count || 0) > 0
+        napcatQQ.value = status.connections?.[0]?.qq || ''
         lastCheckTime.value = new Date().toLocaleTimeString('zh-CN')
       }
     } catch {
@@ -441,10 +436,6 @@ function connectWS() {
 
   ws.onclose = (event) => {
     wsStatus.value = 'disconnected'
-    if (pingTimer) {
-      clearInterval(pingTimer)
-      pingTimer = null
-    }
     if (reconnectTimer) clearTimeout(reconnectTimer)
     if (event.code === 1008) {
       const reason = event.reason || '管理员认证失败。'
@@ -472,7 +463,6 @@ onMounted(() => {
   onViewportChange(compactQuery)
   void fetchNapcatStatus()
   connectWS()
-  statusPollTimer = setInterval(fetchNapcatStatus, 15000)
   window.addEventListener('refresh-napcat-status', handleRefreshStatus)
   mediaQuery.addEventListener('change', onSystemThemeChange)
   compactQuery.addEventListener('change', onViewportChange)
@@ -480,8 +470,6 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (reconnectTimer) clearTimeout(reconnectTimer)
-  if (statusPollTimer) clearInterval(statusPollTimer)
-  if (pingTimer) clearInterval(pingTimer)
   window.removeEventListener('refresh-napcat-status', handleRefreshStatus)
   mediaQuery.removeEventListener('change', onSystemThemeChange)
   compactQuery.removeEventListener('change', onViewportChange)

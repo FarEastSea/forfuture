@@ -144,9 +144,11 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
+import { onMounted, ref, watch } from 'vue'
 import { Message } from '@arco-design/web-vue'
-import { authApi, qqApi } from '@/api'
+import { toQqPost } from '@/api/adapters'
+import { v2Api } from '@/api/v2'
+import { useRealtimeStore } from '@/stores/realtime'
 import { IconSync, IconHeart, IconMessage, IconEmpty } from '@arco-design/web-vue/es/icon'
 
 const posts = ref<any[]>([])
@@ -162,16 +164,16 @@ const crawlStatus = ref<any>(null)
 const page = ref(1)
 const pageSize = 20
 const total = ref(0)
-let crawlStatusTimer: ReturnType<typeof setInterval> | null = null
+const realtime = useRealtimeStore()
 
 async function loadPosts() {
   loading.value = true
   postsError.value = ''
   try {
-    const params: any = { page: page.value, page_size: pageSize }
-    if (selectedQQ.value) params.qq_number = selectedQQ.value
-    const { data } = await qqApi.getPosts(params)
-    posts.value = data.items || []
+    const params: any = { platform: 'qq', page: page.value, page_size: pageSize }
+    if (selectedQQ.value) params.account_id = selectedQQ.value
+    const { data } = await v2Api.listContent(params)
+    posts.value = (data.items || []).map(toQqPost)
     total.value = data.total || 0
   } catch (error) {
     posts.value = []
@@ -184,8 +186,8 @@ async function loadPosts() {
 
 async function loadAccounts() {
   try {
-    const { data } = await qqApi.getAccounts()
-    accounts.value = data || []
+    const { data } = await v2Api.listTargets('qq')
+    accounts.value = data.items || []
   } catch (error) {
     Message.error(getErrorMessage(error, '监控账号加载失败，请检查设置页配置。'))
   }
@@ -193,65 +195,41 @@ async function loadAccounts() {
 
 async function loadLoginAccounts() {
   try {
-    const { data } = await authApi.getAccounts('qq')
-    loginAccounts.value = (data || []).filter((a: any) => a.is_target === 0)
+    const { data } = await v2Api.listCredentials('qq')
+    loginAccounts.value = data.items || []
   } catch (error) {
     Message.error(getErrorMessage(error, 'QQ登录账号加载失败，请检查设置页配置。'))
   }
 }
 
 async function startCrawl() {
-  const ids = accounts.value.map((a: any) => a.account_id)
-  if (ids.length === 0) {
+  const ids = accounts.value.map((a: any) => a.id).filter(Boolean)
+  if (accounts.value.length === 0) {
     Message.warning('请先在设置中添加要监控的QQ号')
     return
   }
   crawling.value = true
   try {
-    await qqApi.crawl(ids, crawlMode.value, {
-      login_account_id: selectedLoginAccountId.value || undefined,
+    await v2Api.createCrawl({
+      platform: 'qq',
+      mode: crawlMode.value,
+      target_account_ids: ids.length ? ids : undefined,
+      credential_id: selectedLoginAccountId.value || undefined,
     })
-    pollCrawlStatus()
   } catch (error) {
     crawling.value = false
-    crawlStatus.value = {
-      error: getErrorMessage(error, 'QQ 抓取任务启动失败，请稍后再试。'),
-      running: false,
-    }
+    crawlStatus.value = { error: getErrorMessage(error, 'QQ 抓取任务启动失败，请稍后再试。'), running: false }
     Message.error(crawlStatus.value.error)
   }
 }
 
-async function pollCrawlStatus() {
-  if (crawlStatusTimer) {
-    clearInterval(crawlStatusTimer)
-  }
-
-  crawlStatusTimer = setInterval(async () => {
-    try {
-      const { data } = await qqApi.getCrawlStatus()
-      crawlStatus.value = data
-      if (!data.running) {
-        if (crawlStatusTimer) {
-          clearInterval(crawlStatusTimer)
-          crawlStatusTimer = null
-        }
-        crawling.value = false
-        void loadPosts()
-      }
-    } catch (error) {
-      if (crawlStatusTimer) {
-        clearInterval(crawlStatusTimer)
-        crawlStatusTimer = null
-      }
-      crawling.value = false
-      crawlStatus.value = {
-        error: getErrorMessage(error, 'QQ 抓取状态更新失败，请稍后手动刷新。'),
-        running: false,
-      }
-    }
-  }, 2000)
-}
+watch(() => realtime.crawls.qq, (event) => {
+  if (!event) return
+  const finished = event.event_type === 'crawl.job.finished'
+  crawling.value = !finished
+  crawlStatus.value = { ...event, running: !finished, progress: event.message || event.status }
+  if (finished) void loadPosts()
+}, { deep: true })
 
 function getErrorMessage(error: unknown, fallback: string) {
   if (error instanceof Error && error.message) {
@@ -326,14 +304,9 @@ function getCurrentNickname(post: any): string {
 }
 
 onMounted(() => {
+  realtime.connect()
   loadAccounts()
   loadLoginAccounts()
   loadPosts()
-})
-
-onUnmounted(() => {
-  if (crawlStatusTimer) {
-    clearInterval(crawlStatusTimer)
-  }
 })
 </script>

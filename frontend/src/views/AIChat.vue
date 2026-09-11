@@ -112,15 +112,20 @@
             >
               <div class="message-bubble">
                 <div class="message-content" v-html="renderMarkdown(message.content)"></div>
+                <div class="tool-trace" v-if="message.toolCalls && message.toolCalls.length">
+                  <a-tag v-for="(call, index) in message.toolCalls" :key="index" size="small" color="purple">
+                    {{ call.name }}{{ call.error ? ' 失败' : (call.done ? ' 完成' : ' 调用中') }}
+                  </a-tag>
+                </div>
                 <div class="message-sources" v-if="message.sources && message.sources.length">
                   <span class="source-label">引用来源：</span>
                   <a-tag
                     v-for="(source, index) in message.sources"
                     :key="index"
                     size="small"
-                    :color="source.type === 'qq' ? 'blue' : 'red'"
+                    :color="(source.type || source.platform) === 'qq' ? 'blue' : 'red'"
                   >
-                    {{ source.type === 'qq' ? 'QQ' : '小红书' }} #{{ source.id }}
+                    {{ (source.type || source.platform) === 'qq' ? 'QQ' : '小红书' }} #{{ source.id || source.content_item_id }}
                   </a-tag>
                 </div>
               </div>
@@ -129,6 +134,11 @@
 
             <div v-if="streaming" class="message-wrap assistant">
               <div class="message-bubble streaming">
+                <div class="tool-trace" v-if="streamTools.length">
+                  <a-tag v-for="(call, index) in streamTools" :key="index" size="small" color="purple">
+                    {{ call.name }}{{ call.error ? ' 失败' : (call.done ? ' 完成' : ' 调用中') }}
+                  </a-tag>
+                </div>
                 <div class="message-content" v-html="renderMarkdown(streamContent)"></div>
                 <span class="typing-cursor">|</span>
               </div>
@@ -158,7 +168,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref } from 'vue'
 import { Message } from '@arco-design/web-vue'
-import { chatApi } from '@/api'
+import { v2Api } from '@/api/v2'
 import { IconDelete, IconMessage, IconPlus, IconRefresh, IconRobot, IconSend } from '@arco-design/web-vue/es/icon'
 import MarkdownIt from 'markdown-it'
 
@@ -174,6 +184,7 @@ const messagesLoading = ref(false)
 const messagesError = ref('')
 const streaming = ref(false)
 const streamContent = ref('')
+const streamTools = ref<any[]>([])
 const messagesRef = ref<HTMLElement | null>(null)
 
 const activeSession = computed(() => {
@@ -221,8 +232,8 @@ async function loadSessions(selectFirstSession = !currentSessionId.value) {
   sessionsError.value = ''
 
   try {
-    const { data } = await chatApi.getSessions()
-    sessions.value = data || []
+    const { data } = await v2Api.listAgentSessions()
+    sessions.value = data.items || data || []
 
     if (selectFirstSession && sessions.value.length) {
       await selectSession(sessions.value[0].id)
@@ -237,7 +248,7 @@ async function loadSessions(selectFirstSession = !currentSessionId.value) {
 
 async function createSession() {
   try {
-    const { data } = await chatApi.createSession()
+    const { data } = await v2Api.createAgentSession()
     sessions.value = [{ id: data.id, title: data.title }, ...sessions.value]
     currentSessionId.value = data.id
     messages.value = []
@@ -255,8 +266,8 @@ async function selectSession(id: number) {
   messagesError.value = ''
 
   try {
-    const { data } = await chatApi.getMessages(id)
-    messages.value = data || []
+    const { data } = await v2Api.listAgentMessages(id)
+    messages.value = data.items || data || []
     scrollToBottom()
   } catch (error) {
     messages.value = []
@@ -269,7 +280,7 @@ async function selectSession(id: number) {
 
 async function deleteSession(id: number) {
   try {
-    await chatApi.deleteSession(id)
+    await v2Api.deleteAgentSession(id)
     const remainingSessions = sessions.value.filter((session) => session.id !== id)
     sessions.value = remainingSessions
 
@@ -306,9 +317,10 @@ async function sendMessage(event?: Event) {
 
   streaming.value = true
   streamContent.value = ''
+  streamTools.value = []
 
   try {
-    const response = await chatApi.sendMessage(currentSessionId.value, text)
+    const response = await v2Api.sendAgentMessage(currentSessionId.value, text)
     if (!response.body) {
       throw new Error('AI 未返回有效内容，请稍后再试。')
     }
@@ -318,6 +330,7 @@ async function sendMessage(event?: Event) {
     let buffer = ''
     let streamErrorMessage = ''
     let shouldStop = false
+    let usedJsonEvents = false
 
     while (true) {
       const { done, value } = await reader.read()
@@ -350,6 +363,30 @@ async function sendMessage(event?: Event) {
           continue
         }
 
+        try {
+          const event = JSON.parse(dataChunk)
+          usedJsonEvents = true
+          if (event.type === 'token' && event.content) {
+            streamContent.value += event.content
+          } else if (event.type === 'tool') {
+            streamTools.value = [...streamTools.value, { name: event.name, done: false }]
+          } else if (event.type === 'tool_result') {
+            streamTools.value = streamTools.value.map((call) =>
+              call.name === event.name && !call.done
+                ? { ...call, done: true, error: event.error }
+                : call,
+            )
+          } else if (event.type === 'done') {
+            shouldStop = true
+          }
+          scrollToBottom()
+          continue
+        } catch {
+          if (usedJsonEvents) {
+            continue
+          }
+        }
+
         streamContent.value += dataChunk
         scrollToBottom()
       }
@@ -364,7 +401,7 @@ async function sendMessage(event?: Event) {
     }
 
     const finalContent = streamContent.value.trim()
-    if (!finalContent) {
+    if (!finalContent && !streamTools.value.length) {
       throw new Error('AI 未返回有效内容，请稍后再试。')
     }
 
@@ -373,7 +410,8 @@ async function sendMessage(event?: Event) {
       {
         _tempId: Date.now() + 1,
         role: 'assistant',
-        content: finalContent,
+        content: finalContent || '已完成工具调用。',
+        toolCalls: [...streamTools.value],
         created_at: new Date().toISOString(),
       },
     ]
@@ -395,6 +433,7 @@ async function sendMessage(event?: Event) {
   } finally {
     streaming.value = false
     streamContent.value = ''
+    streamTools.value = []
     sessions.value = sessions.value.map((session) => {
       if (session.id !== currentSessionId.value) {
         return session

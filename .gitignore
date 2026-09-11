@@ -1,30 +1,55 @@
+# Secrets and machine-local configuration
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python
 .venv/
-.vscode/
-.omc/
-.tmp/
+venv/
+env/
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*.pyd
+*.so
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 .coverage.*
 htmlcov/
-node_modules/
+coverage.xml
+*.egg-info/
+build/
 dist/
+
+# Node and frontend builds
+node_modules/
 .vite/
-.cache/
 .npm/
 .pnpm-store/
 *.tsbuildinfo
+frontend/dist/
+
+# Runtime state
+.tmp/
+.cache/
 *.log
 *.pid
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
 backend/logs/
 backend/app/logs/
+backend/browser_data/
+backend/browser_profiles/
+backend/browser_runtime/
+
+# Downloaded media is persistent user data, not source code
 backend/static/qq_images/*
 backend/static/xhs_images/*
 backend/static/avatars/*
@@ -33,3 +58,15 @@ backend/static/xhs_videos/*
 !backend/static/qq_images/.gitkeep
 !backend/static/xhs_images/.gitkeep
 !backend/static/avatars/.gitkeep
+!backend/static/qq_videos/.gitkeep
+!backend/static/xhs_videos/.gitkeep
+
+# Editors and operating systems
+.vscode/
+.idea/
+.omc/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo

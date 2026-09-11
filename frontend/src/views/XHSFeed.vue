@@ -183,9 +183,11 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import { Message } from '@arco-design/web-vue'
-import { authApi, xhsApi } from '@/api'
+import { toXhsNote } from '@/api/adapters'
+import { v2Api } from '@/api/v2'
+import { useRealtimeStore } from '@/stores/realtime'
 import { IconSync, IconHeart, IconStar, IconEmpty, IconImage, IconShareAlt, IconMessage } from '@arco-design/web-vue/es/icon'
 
 const notes = ref<any[]>([])
@@ -205,17 +207,17 @@ const detailVisible = ref(false)
 const detailNote = ref<any>(null)
 const crawlingComments = ref(false)
 const commentsFeedback = ref('')
-let crawlStatusTimer: ReturnType<typeof setInterval> | null = null
 let commentsRefreshTimer: ReturnType<typeof setTimeout> | null = null
+const realtime = useRealtimeStore()
 
 async function loadNotes() {
   loading.value = true
   notesError.value = ''
   try {
-    const params: any = { page: page.value, page_size: pageSize }
-    if (selectedUid.value) params.xhs_uid = selectedUid.value
-    const { data } = await xhsApi.getNotes(params)
-    notes.value = data.items || []
+    const params: any = { platform: 'xhs', page: page.value, page_size: pageSize }
+    if (selectedUid.value) params.account_id = selectedUid.value
+    const { data } = await v2Api.listContent(params)
+    notes.value = (data.items || []).map(toXhsNote)
     total.value = data.total || 0
   } catch (error) {
     notes.value = []
@@ -226,8 +228,8 @@ async function loadNotes() {
 
 async function loadAccounts() {
   try {
-    const { data } = await xhsApi.getAccounts()
-    accounts.value = data || []
+    const { data } = await v2Api.listTargets('xhs')
+    accounts.value = data.items || []
   } catch (error) {
     Message.error(getErrorMessage(error, '监控账号加载失败，请检查设置页配置。'))
   }
@@ -235,66 +237,45 @@ async function loadAccounts() {
 
 async function loadLoginAccounts() {
   try {
-    const { data } = await authApi.getAccounts('xhs')
-    loginAccounts.value = (data || []).filter((a: any) => a.is_target === 0)
+    const { data } = await v2Api.listCredentials('xhs')
+    loginAccounts.value = data.items || []
   } catch (error) {
     Message.error(getErrorMessage(error, '小红书登录账号加载失败，请检查设置页配置。'))
   }
 }
 
 async function startCrawl() {
-  const ids = accounts.value.map((a: any) => a.account_id)
-  if (!ids.length) {
+  if (!accounts.value.length) {
     Message.warning('请先在设置中添加要监控的小红书账号')
     return
   }
   crawling.value = true
   try {
-    await xhsApi.crawl(ids, crawlMode.value, {
-      login_account_id: selectedLoginAccountId.value || undefined,
+    await v2Api.createCrawl({
+      platform: 'xhs',
+      mode: crawlMode.value,
+      target_account_ids: accounts.value.map((a: any) => a.id).filter(Boolean),
+      credential_id: selectedLoginAccountId.value || undefined,
     })
-    if (crawlStatusTimer) {
-      clearInterval(crawlStatusTimer)
-    }
-
-    crawlStatusTimer = setInterval(async () => {
-      try {
-        const { data } = await xhsApi.getCrawlStatus()
-        crawlStatus.value = data
-        if (!data.running) {
-          if (crawlStatusTimer) {
-            clearInterval(crawlStatusTimer)
-            crawlStatusTimer = null
-          }
-          crawling.value = false
-          void loadNotes()
-        }
-      } catch (error) {
-        if (crawlStatusTimer) {
-          clearInterval(crawlStatusTimer)
-          crawlStatusTimer = null
-        }
-        crawling.value = false
-        crawlStatus.value = {
-          error: getErrorMessage(error, '小红书抓取状态更新失败，请稍后手动刷新。'),
-          running: false,
-        }
-      }
-    }, 2000)
   } catch (error) {
     crawling.value = false
-    crawlStatus.value = {
-      error: getErrorMessage(error, '小红书抓取任务启动失败，请稍后再试。'),
-      running: false,
-    }
+    crawlStatus.value = { error: getErrorMessage(error, '小红书抓取任务启动失败，请稍后再试。'), running: false }
     Message.error(crawlStatus.value.error)
   }
 }
 
+watch(() => realtime.crawls.xhs, (event) => {
+  if (!event) return
+  const finished = event.event_type === 'crawl.job.finished'
+  crawling.value = !finished
+  crawlStatus.value = { ...event, running: !finished, progress: event.message || event.status }
+  if (finished) void loadNotes()
+}, { deep: true })
+
 async function showDetail(note: any) {
   try {
-    const { data } = await xhsApi.getNote(note.id)
-    detailNote.value = data
+    const { data } = await v2Api.getContent(note.id)
+    detailNote.value = toXhsNote(data)
     detailVisible.value = true
     commentsFeedback.value = ''
   } catch {
@@ -309,8 +290,8 @@ async function crawlNoteComments(note: any) {
   crawlingComments.value = true
   commentsFeedback.value = '评论抓取任务已提交，预计 15 秒内可刷新到最新内容。'
   try {
-    await xhsApi.crawlNoteComments(note.id)
-    Message.info('评论抓取任务已启动，系统会稍后自动刷新详情。')
+    await v2Api.createCrawl({ platform: 'xhs', mode: 'repair', target_account_ids: note.target_account_id ? [note.target_account_id] : undefined })
+    Message.info('修复采集任务已启动，完成后会自动刷新详情。')
 
     if (commentsRefreshTimer) {
       clearTimeout(commentsRefreshTimer)
@@ -318,8 +299,8 @@ async function crawlNoteComments(note: any) {
 
     commentsRefreshTimer = setTimeout(async () => {
       try {
-        const { data } = await xhsApi.getNote(note.id)
-        detailNote.value = data
+        const { data } = await v2Api.getContent(note.id)
+        detailNote.value = toXhsNote(data)
         commentsFeedback.value = '最新评论已自动刷新。'
       } catch {
         commentsFeedback.value = '评论抓取完成，但自动刷新失败，请手动重开详情查看。'
@@ -359,7 +340,7 @@ function normalizeRemoteMediaUrl(url: string): string {
 }
 
 function buildProxyMediaUrl(url: string): string {
-  return `/api/proxy/image?url=${encodeURIComponent(normalizeRemoteMediaUrl(url))}`
+  return `/api/v2/media/proxy?url=${encodeURIComponent(normalizeRemoteMediaUrl(url))}`
 }
 
 function getAvatarSrc(url: string): string {
@@ -411,12 +392,9 @@ function formatDuration(seconds: number) {
   return m > 0 ? `${m}分${s.toString().padStart(2, '0')}秒` : `${s}秒`
 }
 
-onMounted(() => { loadAccounts(); loadLoginAccounts(); loadNotes() })
+onMounted(() => { realtime.connect(); loadAccounts(); loadLoginAccounts(); loadNotes() })
 
 onUnmounted(() => {
-  if (crawlStatusTimer) {
-    clearInterval(crawlStatusTimer)
-  }
   if (commentsRefreshTimer) {
     clearTimeout(commentsRefreshTimer)
   }

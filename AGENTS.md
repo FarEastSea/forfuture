@@ -12,12 +12,12 @@
 
 - 这是一个围绕 QQ 空间、小红书内容采集与 AI 提醒构建的全栈应用。
 - 后端负责采集、账号管理、AI 对话、任务调度、NapCat WebSocket 联动。
-- 前端是管理台，核心页面固定为 QQ 空间、小红书、AI 对话、定时任务、设置。
+- 前端是管理台，核心页面为 QQ 空间、小红书、知识库、AI 对话、定时任务、设置。
 
 ## 技术栈
 
-- 后端：FastAPI + SQLAlchemy asyncio + PostgreSQL + Alembic + APScheduler + Playwright
-- 前端：Vue 3 + Vite + TypeScript + Arco Design
+- 后端：FastAPI + SQLAlchemy asyncio + PostgreSQL + Alembic + APScheduler + patchright/Playwright + Redis/arq
+- 前端：Vue 3 + Vite + TypeScript + Arco Design + Pinia
 - 插件：NapCat 插件通过 WebSocket 与后端通信
 
 ## 关键入口
@@ -25,12 +25,17 @@
 - 后端入口：backend/app/main.py
 - 前端入口：frontend/src/App.vue
 - 前端路由：frontend/src/router/index.ts
-- 系统配置与状态接口：backend/app/routers/system.py
-- 账号与扫码登录接口：backend/app/routers/auth.py
-- QQ / 小红书接口：backend/app/routers/qq.py、backend/app/routers/xhs.py
-- 统一账号风控：backend/app/services/account_risk_service.py
-- 调度器：backend/app/services/task_scheduler.py
+- 新栈 API：backend/app/api/v2/（`/api/v2/*`）
+- 实时事件：`/ws/v2/events`
+- 系统配置：backend/app/api/v2/system.py
+- 账号与扫码登录：backend/app/api/v2/auth.py；其内部暂时复用 backend/legacy/services 的浏览器登录实现
+- QQ / 小红书采集插件：backend/app/platforms/qq、backend/app/platforms/xhs
+- 统一账号风控：backend/app/crawl/risk.py
+- 采集引擎：backend/app/crawl/engine.py
+- 知识库：backend/app/knowledge/
+- Agent：backend/app/agent/
 - NapCat 插件入口：napcat-plugin-airecordsandreminders/index.mjs
+- 旧代码归档：backend/legacy/（不再对外挂载；完成 v2 登录实现迁移前不要删除）
 
 ## 联调与验证原则
 
@@ -56,7 +61,7 @@
 
 - 在浏览器访问 `REMOTE_SMOKE_BASE_URL` 指向的公网地址。
 - 至少检查：首页可访问、登录可用、设置页可打开、QQ 页面可加载、小红书页面可加载。
-- 如果涉及管理员功能或系统状态，还要验证管理员令牌相关接口与 `/ws/client` 握手。
+- 如果涉及管理员功能或系统状态，还要验证管理员令牌相关接口与 `/ws/v2/events` 握手。
 
 ## 本地启动（仅在明确要求时）
 
@@ -74,7 +79,7 @@
 
 ## 管理员认证
 
-- 管理员 HTTP / WebSocket 认证实现在 backend/app/security.py。
+- 管理员 HTTP / WebSocket 认证实现在 backend/app/core/security.py。
 - 优先使用 `ADMIN_API_TOKEN`；未配置时仅在 `SECRET_KEY` 不是默认值时回退使用 `SECRET_KEY`。
 - 前端本地存储 key 为 `admin_api_token`，封装在 frontend/src/utils/adminToken.ts。
 - 许多系统状态、设置、WebSocket 功能都依赖这个令牌；仅在明确要求本地调试时才需要本地确认它可用。
@@ -82,7 +87,7 @@
 ## 账号与风控规则
 
 - 监控账号（target account）和登录账号（login account）是两类不同实体，不要混用。
-- 登录账号风控已经统一收口到 backend/app/services/account_risk_service.py。
+- 登录账号风控已经统一收口到 backend/app/crawl/risk.py。
 - 调度器、QQ 爬虫、小红书爬虫都应传递“选中的登录账号”，不要在内部重新随意挑选活跃账号。
 - 风控状态包括 active、degraded、cooldown、relogin_pending、expired 等；涉及自动抓取时默认走 fail-closed。
 

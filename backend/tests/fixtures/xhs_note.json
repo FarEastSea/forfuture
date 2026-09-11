@@ -1,0 +1,30 @@
+{
+  "type": "normal",
+  "note_id": "note-1",
+  "title": "周末出行",
+  "desc": "天气很好",
+  "time": 1710000000000,
+  "ip_location": "江苏",
+  "user": {"user_id": "u1", "nickname": "Carol", "avatar": "https://sns-avatar.xhscdn.com/a.jpg"},
+  "interact_info": {"liked_count": "1.2万", "comment_count": 4, "collected_count": 8, "share_count": 1},
+  "tag_list": [{"name": "旅行"}],
+  "image_list": [
+    {
+      "url_default": "https://sns-webpic-qc.xhscdn.com/note.jpg!nd_dft_wlteh_webp_3",
+      "url_pre": "https://sns-webpic-qc.xhscdn.com/note.webp",
+      "info_list": [
+        {"url": "https://sns-webpic-qc.xhscdn.com/small.webp"},
+        {"url": "https://sns-webpic-qc.xhscdn.com/large.jpg"}
+      ]
+    }
+  ],
+  "video": {
+    "media": {
+      "stream": {
+        "h265": [{"id": "2", "master_url": "https://sns-video.xhscdn.com/h265.mp4"}],
+        "h264": [{"id": "1", "master_url": "https://sns-video.xhscdn.com/h264.mp4"}]
+      }
+    },
+    "capa": {"duration": 12}
+  }
+}
